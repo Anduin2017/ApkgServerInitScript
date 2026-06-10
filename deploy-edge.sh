@@ -1,0 +1,303 @@
+#!/bin/bash
+
+#=============================================================================
+# AnduinOS Edge Mirror — One-Shot Idempotent Deployer
+#
+# This script is safe to run repeatedly on the same server.  Every run will:
+#   • install any missing system packages
+#   • overwrite every config file with the canonical version (self-healing)
+#   • pull the latest Docker images
+#   • bring containers up if they are down, or recreate them if config changed
+#   • leave the existing /opt/anduinos-edge/data untouched
+#
+# The only destructive action is killing an unknown process on port 80 —
+# once the deployment is up, docker-proxy owns that port and re-runs skip it.
+#=============================================================================
+
+#==========================
+# Basic Information
+#==========================
+export LC_ALL=C.UTF-8
+export LANG=C.UTF-8
+export DEBIAN_FRONTEND=noninteractive
+
+#==========================
+# Color & UI
+#==========================
+Green="\033[32m"
+Red="\033[31m"
+Yellow="\033[33m"
+Blue="\033[36m"
+Font="\033[0m"
+GreenBG="\033[42;37m"
+RedBG="\033[41;37m"
+OK="${Green}[  OK  ]${Font}"
+ERROR="${Red}[FAILED]${Font}"
+WARNING="${Yellow}[ WARN ]${Font}"
+
+function print_ok() {
+  echo -e "${OK} ${Blue} $1 ${Font}"
+}
+
+function print_error() {
+  echo -e "${ERROR} ${Red} $1 ${Font}"
+}
+
+function judge() {
+  if [[ 0 -eq $? ]]; then
+    print_ok "$1 succeeded"
+    sleep 1
+  else
+    print_error "$1 failed"
+    exit 1
+  fi
+}
+
+function areYouSure() {
+  print_error "This script found some issue and failed to run."
+  print_error "Are you sure to continue the installation? Enter [y/N] to continue"
+  read -r install
+  case $install in
+  [yY][eE][sS] | [yY])
+    print_ok "Continuing the installation..."
+    ;;
+  *)
+    print_error "Installation terminated."
+    exit 1
+    ;;
+  esac
+}
+
+function port_exist_check() {
+  if [[ 0 -eq $(sudo ss -tlnp "sport = :$1" | grep -c ":$1") ]]; then
+    print_ok "Port $1 is not in use"
+    return 0
+  fi
+
+  # On re-run, port 80 may be held by our own Docker Caddy container.
+  # Recognise it by the docker-proxy process name and skip killing.
+  if sudo ss -tlnp "sport = :$1" | grep -q "docker-proxy"; then
+    print_ok "Port $1 is managed by Docker (existing deployment, will refresh)"
+    return 0
+  fi
+
+  print_error "Warning: Port $1 is occupied by an unknown process"
+  sudo ss -tlnp "sport = :$1"
+  print_error "Will kill the occupied process in 5s..."
+  sleep 5
+  sudo ss -tlnp "sport = :$1" | grep -oP 'pid=\K[0-9]+' | sudo xargs kill -9
+  print_ok "Killed the occupied process on port $1"
+}
+
+#==========================
+# Begin of the installation
+#==========================
+clear
+cd ~
+echo -e "${Green}========================================================================${Font}"
+echo -e "${Blue}  Welcome to AnduinOS Edge Node Automated Installer${Font}"
+echo -e "${Blue}  Architecture: Pure HTTP Caddy + Rclone Atomic Sync + Cloudflare${Font}"
+echo -e "${Green}========================================================================${Font}"
+print_ok "Please press [ENTER] to continue, or press CTRL+C to cancel."
+read
+
+#==========================
+# Check OS Version
+#==========================
+print_ok "Checking OS version..."
+if ! lsb_release -a | grep -E "Ubuntu (24|25|26)" > /dev/null; then
+  print_error "You do not seem to be running Ubuntu 24.04/25.04/26.04."
+  areYouSure
+fi
+judge "OS Check Passed"
+
+#==========================
+# Test network
+#==========================
+print_ok "Testing network connection..."
+if ! curl -s --head --request GET https://cloudflare.com/cdn-cgi/trace | grep "200" > /dev/null; then
+  print_error "You are not able to access Internet. Please check your network!"
+  areYouSure
+fi
+judge "Network connection works"
+
+#==========================
+# Check Port 80
+#==========================
+print_ok "Checking Port 80 for Caddy..."
+port_exist_check 80
+judge "Port 80 is clear"
+
+#==========================
+# Update and Install Dependencies
+#==========================
+print_ok "Installing basic packages and Docker..."
+DEBIAN_FRONTEND=noninteractive sudo apt update
+DEBIAN_FRONTEND=noninteractive sudo apt install -y curl wget git vim net-tools ufw apt-transport-https ca-certificates software-properties-common
+
+# Install Docker
+if ! command -v docker >/dev/null 2>&1; then
+    print_ok "Docker not found, installing via official script..."
+    curl -fsSL https://get.docker.com -o get-docker.sh
+    sudo sh get-docker.sh
+    rm get-docker.sh
+else
+    print_ok "Docker is already installed."
+fi
+# Ensure docker compose plugin is installed
+DEBIAN_FRONTEND=noninteractive sudo apt install -y docker-compose-plugin
+
+# Ensure Docker daemon is running (may be stopped on re-run)
+# Also ensure it starts on boot (defence in depth for VPS templates)
+sudo systemctl enable docker 2>/dev/null || true
+if ! sudo systemctl is-active --quiet docker; then
+    print_ok "Docker daemon not running, starting..."
+    sudo systemctl start docker
+fi
+judge "Basic packages and Docker installed"
+
+#==========================
+# System Optimizations (BBR)
+#==========================
+enable_bbr_force()
+{
+    print_ok "Enabling BBR..."
+    echo 'net.core.default_qdisc=fq' | sudo tee -a /etc/sysctl.conf
+    echo 'net.ipv4.tcp_congestion_control=bbr' | sudo tee -a /etc/sysctl.conf
+    sudo sysctl -p
+    judge "BBR Enabled"
+}
+sysctl net.ipv4.tcp_available_congestion_control | grep -q bbr || enable_bbr_force
+print_ok "BBR is active"
+
+echo "Setting timezone to UTC..."
+sudo timedatectl set-timezone UTC
+
+#==========================
+# Firewall (UFW)
+#==========================
+print_ok "Configuring UFW firewall..."
+sudo ufw allow 22/tcp
+sudo ufw allow 80/tcp
+echo "y" | sudo ufw enable
+judge "UFW configured"
+
+#==========================
+# Build AnduinOS Edge Environment
+#==========================
+WORKDIR="/opt/anduinos-edge"
+print_ok "Creating work directory at $WORKDIR..."
+sudo mkdir -p $WORKDIR/data
+cd $WORKDIR
+
+# 1. Generate docker-compose.yml
+print_ok "Generating Docker Compose config..."
+sudo bash -c "cat > docker-compose.yml" << 'EOF'
+services:
+  caddy-server:
+    image: caddy:alpine
+    container_name: anduinos_caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./data:/data:ro
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    depends_on:
+      rclone-worker:
+        condition: service_healthy
+
+  rclone-worker:
+    image: rclone/rclone:latest
+    container_name: anduinos_sync
+    restart: unless-stopped
+    entrypoint: ["/bin/sh"]
+    command: ["/sync-logic.sh"]
+    volumes:
+      - ./data:/data
+      - ./sync-logic.sh:/sync-logic.sh:ro
+    healthcheck:
+      test: ["CMD", "test", "-f", "/data/www/sync_status.json"]
+      interval: 30s
+      timeout: 5s
+      retries: 60
+      start_period: 10s
+EOF
+
+# 2. Generate Caddyfile (Pure HTTP)
+print_ok "Generating pure HTTP Caddyfile..."
+sudo bash -c "cat > Caddyfile" << 'EOF'
+:80 {
+    root * /data/www
+    file_server browse {
+        hide .staging www_old
+    }
+    encode zstd gzip
+}
+EOF
+
+# 3. Generate Rclone Atomic Sync Script
+print_ok "Generating Atomic Sync logic..."
+sudo bash -c "cat > sync-logic.sh" << 'EOF'
+#!/bin/sh
+
+SOURCE_URL="https://apkg-dav.aiursoft.com/"
+
+echo "[$(date)] Rclone worker started."
+
+while true; do
+    echo "[$(date)] Starting atomic sync from $SOURCE_URL..."
+
+    mkdir -p /data/.staging /data/www
+
+    if rclone sync :webdav: /data/.staging/ --webdav-url "$SOURCE_URL" -v; then
+        echo "[$(date)] Sync to staging successful. Stripping UTF-8 BOM from GPG-signed files..."
+        find /data/.staging -type f \( -name "InRelease" -o -name "Release" \) -exec sed -i '1s/^\xef\xbb\xbf//' {} \;
+
+        echo "[$(date)] Performing atomic switch..."
+
+        rm -rf /data/www_old
+        mv /data/www /data/www_old 2>/dev/null || true
+        mv /data/.staging /data/www
+
+        date -u +"%Y-%m-%dT%H:%M:%SZ" > /data/www/sync_status.json
+
+        echo "[$(date)] Atomic switch completed."
+    else
+        echo "[$(date)] Sync failed! Current production data is protected. Retrying next cycle."
+    fi
+
+    echo "[$(date)] Sleeping for 1 hour..."
+    sleep 3600
+done
+EOF
+sudo chmod +x sync-logic.sh
+
+#==========================
+# Launch Services
+#==========================
+print_ok "Pulling latest images and launching services..."
+sudo docker compose pull
+sudo docker compose up -d
+judge "Docker Compose services started"
+
+#==========================
+# Post-Installation Summary
+#==========================
+SERVER_IP=$(curl -s -4 ip.sb)
+echo -e "\n${GreenBG}====================================================${Font}"
+echo -e "${GreenBG}       AnduinOS Edge Node Deployed Successfully!    ${Font}"
+echo -e "${GreenBG}====================================================${Font}\n"
+
+echo -e "${Blue}The server is now acting as a mirror node.${Font}"
+echo -e "Rclone is syncing from apkg-dav in the background."
+echo -e "To view sync logs, run: ${Yellow}docker logs -f anduinos_sync${Font}\n"
+
+echo -e "${RedBG} !!! ACTION REQUIRED ON CLOUDFLARE !!! ${Font}"
+echo -e "Because this node uses pure HTTP (no certificates):"
+echo -e "1. Go to your Cloudflare Dashboard for ${Yellow}anduinos.com${Font}."
+echo -e "2. Add a DNS A Record: ${Yellow}packages.anduinos.com${Font} -> ${Yellow}$SERVER_IP${Font} (Orange Cloud ON)."
+echo -e "3. Go to ${Yellow}SSL/TLS -> Overview${Font}."
+echo -e "4. Set encryption mode to ${Yellow}Flexible${Font}."
+
+echo -e "\n${Green}Enjoy your tea, Architecture Master!${Font}\n"
