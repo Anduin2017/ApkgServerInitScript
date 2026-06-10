@@ -221,7 +221,7 @@ services:
       interval: 30s
       timeout: 5s
       retries: 60
-      start_period: 10s
+      start_period: 7200s
 EOF
 
 # 2. Generate Caddyfile (Pure HTTP)
@@ -339,7 +339,10 @@ while true; do
     find "$STAGING" -name "*.partial" -delete 2>/dev/null || true
 
     echo "[$(date)] [RCLONE] Starting rclone sync..."
-    if rclone sync :webdav: "$STAGING/" --webdav-url "$SOURCE_URL" -v --delete-after; then
+    # --inplace=false (the default for local) forces write-to-tmp + rename,
+    # which breaks any hardlink from cp -aln.  If a file is updated, the
+    # old inode in $CURRENT is untouched until the symlink swap.
+    if rclone sync :webdav: "$STAGING/" --webdav-url "$SOURCE_URL" -v --delete-after --inplace=false; then
         echo "[$(date)] [RCLONE] Done."
 
         echo "[$(date)] [BOM] Stripping UTF-8 BOM from InRelease / Release..."
