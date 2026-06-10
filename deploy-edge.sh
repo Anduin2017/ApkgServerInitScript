@@ -237,8 +237,8 @@ sudo bash -c "cat > Caddyfile" << 'EOF'
     }
     encode zstd gzip
 
-    # APT metadata — must never be stale
-    header /artifacts/anduinos/dists/* Cache-Control "no-cache"
+    # Default — force revalidation for everything except .deb
+    header * Cache-Control "no-cache"
 
     # .deb packages — content-addressed, immutable
     header /artifacts/anduinos/*/pool/*.deb Cache-Control "public, max-age=31536000, immutable"
