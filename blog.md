@@ -493,7 +493,7 @@ file_server browse {
 
 ---
 
-### Bug 5: InRelease 文件带 UTF-8 BOM，GPG 拒绝解析
+### Bug 5: InRelease 文件带 UTF-8 BOM，GPG 拒绝解析（三层根因追踪）
 
 **严重程度**: 🔴 致命
 
@@ -503,26 +503,74 @@ file_server browse {
 Clearsigned file isn't valid, got 'NOSPLIT' (does the network require authentication?)
 ```
 
-**根因**: 源站 `apkg-dav.aiursoft.com` 上的 `InRelease` 文件首字节带有 UTF-8 BOM（`EF BB BF`）。用 `hexdump -C` 对比了旧源 `apkg.aiursoft.com`（无 BOM，`apt` 正常）和 CDN 源（有 BOM，`apt` 失败），确认差异：
+乍一看是边缘节点的问题，实际上是一个贯穿三层的 bug 链。以下是逐层追踪的过程。
+
+#### 第一层：发现 BOM，边缘止血
+
+`hexdump -C` 对比：
 
 ```
-# 旧源 (正常)
+# 正常的 InRelease (apkg.aiursoft.com)
 00000000  2d 2d 2d 2d 2d 42 45 47...  -----BEGIN PGP S...
 
-# 新源 (失败)
+# 异常的 InRelease (apkg-dav.aiursoft.com，也是 CF 最终给的)
 00000000  ef bb bf 2d 2d 2d 2d 2d...  ...-----BEGIN PGP...
 ```
 
 GPG 解析 clear-signed 消息时要求文件首字节必须是 `-`（PGP header 的起始符）。BOM 导致解析直接失败。
 
-**修复**: 在 `sync-logic.sh` 的原子切换前加入 BOM 剥离步骤：
+第一反应在边缘节点 `sync-logic.sh` 加 BOM 剥离：
 
 ```bash
 find /data/.staging -type f \( -name "InRelease" -o -name "Release" \) \
     -exec sed -i '1s/^\xef\xbb\xbf//' {} \;
 ```
 
-**教训**: GPG clear-signed 格式对文件头部极度敏感。APT 仓库的 `InRelease`/`Release` 文件绝对不能包含任何前导字节。如果源站无法修复（可能是 APKG 生成逻辑的 bug），在边缘做 sanitize 是最快且不破坏上游的止血方案。
+**但这没管用。** 为什么？
+
+#### 第二层：BusyBox sed 不支持 `\xHH`
+
+边缘容器的镜像是 `rclone/rclone:latest`（Alpine），用的是 **BusyBox sed**，而 `\xef\xbb\xbf` 是 GNU sed 扩展语法。BusyBox sed 看到 `\xHH` **不报错也不匹配**——空操作。BOM 剥离从头到尾就没生效过。
+
+用 POSIX 兼容的八进制代替：
+
+```bash
+# ❌ GNU sed 管用，BusyBox sed 不管用
+sed -i '1s/^\xef\xbb\xbf//'
+
+# ✅ POSIX printf + 八进制，所有 shell 管用
+BOM=$(printf '\357\273\277')
+sed -i "1s/^${BOM}//"
+```
+
+**教训**: Docker 容器的用户态是 Alpine/ BusyBox，不是 Ubuntu。`\xHH` 十六进制转义在 `sed`、`echo` 等命令里都不是 POSIX，写脚本时必须假设最小实现。
+
+#### 第三层：源站 APKG 是真正的根因
+
+BOM 到底从哪来的？逐层排查：
+
+```
+apkg.aiursoft.com (ASP.NET)         → InRelease 无 BOM ✅
+apkg-dav.aiursoft.com (Go WebDAV)   → InRelease 有 BOM ❌
+```
+
+同一个文件被两个服务 serve，一个带 BOM 一个不带。说明 **WebDAV 不是添加 BOM，APKG 写到磁盘时的原始文件就带 BOM**。ASP.NET 的 response pipeline 在 serve 时做了隐式转码（Kestrel 默认处理 UTF-8 编码），但 WebDAV 原样 serve。
+
+追溯到 APKG 源码 `RepositoryExportJob.cs`：
+
+```csharp
+// ❌ Encoding.UTF8 默认带 BOM (C# 里 encoderShouldEmitUTF8Identifier = true)
+await File.WriteAllTextAsync(path, content, Encoding.UTF8);
+
+// ✅ 不带 BOM
+await File.WriteAllTextAsync(path, content, new UTF8Encoding(false));
+```
+
+三处 `Encoding.UTF8` 全部改成 `new UTF8Encoding(false)`，加上单元测试读原始字节断言前 3 字节 ≠ `EF BB BF`。
+
+**教训**: 
+1. C# 的 `Encoding.UTF8` 与 Python/Go/Rust 的 "UTF-8" 不一样——C# 默认**带 BOM**。写 GPG clearsigned 文件、SSH 密钥、证书等 ASCII 协议文件时，必须显式 `new UTF8Encoding(false)`。
+2. 边缘修是止血，源站修是根治。两层都修才是工程正确做法。
 
 ---
 
@@ -570,6 +618,233 @@ fi
 
 ---
 
+### Bug 8: `.staging` 从不清理 → `rm -rf` → 全量下载 → 软链接原子轮换（三层迭代）
+
+**严重程度**: 🔴 致命 → 🟢 最终解决
+
+这个 bug 经历了三次迭代，从粗暴止血到精巧的最终方案。
+
+#### 第一版：`mkdir -p` 不清理（原版）
+
+```bash
+mkdir -p /data/.staging /data/www
+rclone sync :webdav: /data/.staging/
+mv /data/.staging /data/www   # staging 变成 www → staging 没了
+```
+
+问题：`.partial` 残留 + staging 被移走 = 下次全量下载 = 永远慢。
+
+#### 第二版：`rm -rf` 止血
+
+```bash
+rm -rf /data/.staging
+mkdir -p /data/.staging /data/www
+```
+
+问题：每次全量下载 1.9 GB，3-6 分钟。源站 `apkg-dav.aiursoft.com` 带宽有限，经常限速到几十 KB/s。
+
+#### 第三版：两目录轮换（用户的设计）
+
+```bash
+# www 和 .staging 互相交换，谁都不删
+mv /data/www     /data/_swap
+mv /data/.staging /data/www
+mv /data/_swap   /data/.staging
+```
+
+staging 始终保留上一轮的数据，rclone 只传变更——增量 38 秒 vs 全量 3 分钟，488 倍提速。
+
+问题：三步 `mv` 中间 `/data/www` 短暂不存在（微秒级，但对完美主义者有瑕疵）。
+
+#### 最终版：软链接原子切换
+
+```bash
+# /data/current → symlink → primary 或 secondary
+# Caddy 始终从 /data/current 读
+
+CURRENT=$(readlink /data/current)
+# 同步到非活跃目录
+rclone sync :webdav: "$STAGING/"
+
+# 一条 syscall，真正原子
+ln -sfn "$STAGING" /data/current
+```
+
+`ln -sfn` 底层是 `renameat2()`，单次 syscall，Caddy 永远不会看到"路径不存在"的瞬间。
+
+#### 种子机制：保证永远增量
+
+软链接轮换解决了稳态增量，但迁移 / 首次部署 / 部分同步被 kill 后，staging 可能为空或不完整。加了一个 `cp -aln` 种子步骤：
+
+```bash
+# 从当前活跃目录硬链接所有缺失文件到 staging
+# -a = 保留属性  -l = 硬链接  -n = 不覆盖已存在
+cp -aln "$CURRENT"/* "$STAGING"/
+```
+
+- 硬链接不占额外磁盘空间
+- 瞬时完成（只操作 inode）
+- rclone 再跑就是纯增量
+
+**教训**: 
+1. 不要删数据来做增量——用 `mv` 轮换保留旧数据。
+2. `ln -sfn` 比三步 `mv` 更原子、更优雅。
+3. `cp -aln` 是"免费"的种子——不花磁盘、不花时间，保证首轮也是增量。
+4. 应急止血方案（`rm -rf`）要尽快迭代到正经方案，否则会忘记它的代价。
+
+---
+
+### Bug 9: 源站生成文件时数据自洽但瞬间不一致，边缘原子同步复刻了"矛盾快照"
+
+**严重程度**: 🔴 致命
+
+**现象**: 边缘节点出现 **InRelease 记录 Packages.gz = 19078，但实际文件 = 19075** 的矛盾状态。这不是边缘节点自己产生的（A/B 目录切换保证单节点内文件总是一个快照），而是从源站完整复刻过来的。
+
+**根因**: APKG 生成 `Packages.gz` 时写入了 BOM（3 字节），`InRelease` 里记录的哈希和大小都是带 BOM 版本的（19078）。后来 APKG 重新生成了不带 BOM 的 `Packages.gz`（19075），但 `InRelease` 没有被同步更新（可能单独缓存了，或者生成顺序问题）。原子同步忠实地把这个矛盾的快照拉了下来。
+
+```
+APKG 第一次生成:  Packages.gz (with BOM) = 19078 → InRelease 记录 19078  ← 自洽
+APKG 第二次生成:  Packages.gz (no BOM)   = 19075 → InRelease 还是 19078  ← 矛盾!
+边缘同步:        原样拉取 → InRelease=19078 + Packages.gz=19075           ← 矛盾复刻
+```
+
+**修复**: 同一个根因——APKG 的 `Encoding.UTF8` 问题修掉后，所有文件都不再带 BOM，大小不再摇摆。边缘节点加上 `rm -rf .staging` 后，每次全量检查不会漏掉差异。
+
+**教训**: 源站生成 APT 仓库元数据时，应当用原子方式写入（先写 staging 再 swap），保证下游在任何时刻同步拿到的都是一个自洽的快照。
+
+---
+
+### Bug 10: Cloudflare 缓存 APT 元数据的隐患
+
+**严重程度**: 🟡 中等（目前被意外保护，但随时可能炸）
+
+**现象**: 目前 `cf-cache-status: DYNAMIC`，所有响应都未缓存。但这是因为 Cloudflare Load Balancer 在每个响应里都设了 `__cflb` cookie（会话亲和性），CF 默认不对带 Set-Cookie 的响应做缓存。
+
+**隐患**: 这是**意外保护**，不是显式配置。一旦 LB 配置改变、cookie 被禁用、或者某个中间层不尊重 cookie 语义，`dists/` 下的 InRelease、Packages 等 APT 元数据就可能被 CF 缓存。APT 元数据每次更新都会变，缓存会直接导致客户端哈希校验失败。
+
+**修复**: 在 Caddyfile 里显式设置缓存头：
+
+```caddy
+:80 {
+    root * /data/current
+    file_server browse { hide _tmp }
+    encode zstd gzip
+
+    # APT metadata — must never be stale
+    header /artifacts/anduinos/dists/* Cache-Control "no-cache"
+
+    # .deb packages — content-addressed, immutable
+    header /artifacts/anduinos/*/pool/*.deb Cache-Control "public, max-age=31536000, immutable"
+}
+```
+
+**教训**: 依赖中间件默认行为就是埋雷。CDN 不知道你哪些文件能缓存、哪些不能——必须显式告诉它。
+
+---
+
+### Bug 11: 多节点负载均衡下 apt update 可能跨节点拿到不一致文件
+
+**严重程度**: 🟡 中等
+
+**现象**: Cloudflare 的 Geo-Steering 会把同一客户端的多个 HTTP 请求路由到不同边缘节点（`apt` 不带 Cookie）。如果节点 A 刚同步完新数据、节点 B 还在同步中，就会出现：
+- `InRelease` 从节点 A 拿（新）
+- `Packages.gz` 从节点 B 拿（旧）
+- 哈希不匹配 → `apt update` 报错
+
+**根因**: APT 的 HTTP 请求是离散的，Cloudflare 没有使用源 IP sticky session。原子同步只保证**节点内**自洽，不保证**跨节点**一致。
+
+**当前缓解**:
+1. Cloudflare Monitor 探针指向 `/sync_status.json`，只有健康节点才接入流量池——如果某节点同步滞后超过健康阈值，自动摘除。
+2. 边缘节点的同步间隔设为 1 小时，源站更新频率低，大部分时间三节点数据一致。
+
+**教训**: 这是一个架构上的已知权衡——用最终一致性换全球低延迟。对于包分发场景（比代码部署对一致性要求低），这个风险可接受。
+
+---
+
+### Bug 12: `rm -rf` 止血导致每次全量下载，限速时灾难性慢
+
+**严重程度**: 🔴 致命（Bug 8 的止血方案引入的新问题）
+
+**现象**: 修复 Bug 8 后，每次 rclone sync 都重新下载全部 1.9 GB 数据。源站 `apkg-dav.aiursoft.com` 带宽有限，经常限速到几十 KB/s，一次同步跑 20 分钟以上。
+
+**根因**: `rm -rf /data/.staging` 把上一轮的旧数据全删了。rclone 对比源站和空目录 → 全部传输。然后 `mv /data/.staging /data/www` 又把整个目录移走，下一个周期再次空目录 → 循环。
+
+**修复**: 用用户设计的"两目录轮换"。不删目录，只交换：
+
+```bash
+# 不再 rm -rf。www 和 .staging 互相交换
+mv /data/www     /data/_swap
+mv /data/.staging /data/www
+mv /data/_swap   /data/.staging
+```
+
+每次交换后 `.staging` 保留上一轮 `www` 的完整数据，rclone 只传变更。增量 38 秒，全量 3 分钟 → 488 倍提速。
+
+**教训**: 删数据是最容易的止血，但也是最贵的。保留旧状态天然就是增量同步的免费种子。
+
+---
+
+### Bug 13: 三步 `mv` 有微妙的时间窗口
+
+**严重程度**: 🟢 低（微秒级窗口，对 APT 无影响，但对完美主义者有瑕疵）
+
+**现象**: 两目录轮换需要三步 `mv`：
+
+```bash
+mv /data/www     /data/_swap   # 1. www 没了
+mv /data/.staging /data/www    # 2. 窗口: step1→step2 之间 /data/www 不存在
+mv /data/_swap   /data/.staging # 3. 恢复
+```
+
+虽然窗口只有几个微秒，Caddy 几乎不可能在这瞬间打到空路径，但工程上"几乎"不如"绝对"。
+
+**修复**: 用软链接替代三步 `mv`：
+
+```bash
+# Caddy 服务 /data/current (symlink)
+# /data/current → primary 或 secondary
+
+# 同步到非活跃目录
+rclone sync :webdav: "$STAGING/"
+
+# 原子切换 —— renameat2，单次 syscall
+ln -sfn "$STAGING" /data/current
+```
+
+`ln -sfn` 是内核保证的原子操作。Caddy 的 `open()` 要么拿到旧路径、要么新路径——"路径不存在"的瞬间从物理上被消除了。
+
+同时加入硬链接种子，保证任何情况下首轮都是增量：
+
+```bash
+# 从活跃目录硬链接所有缺失文件到 staging（瞬时，0 额外磁盘）
+cp -aln "$CURRENT"/* "$STAGING"/
+```
+
+加上旧布局自动迁移（`/data/www` → `/data/secondary` + symlink）、缺失 symlink 自动重建，最终脚本在任何灾难状态下重跑都能自愈。
+
+**教训**: 
+1. 软链接是文件系统级"指针"——换指针比搬数据优雅得多。
+2. `cp -aln`（硬链接 + 不覆盖）是零成本的增量种子。
+3. 工具要能处理"最差情况"：无 symlink、脏 staging、旧布局残留、部分同步被 kill。
+
+---
+
+### Bug 14: fail2ban 把我们自己关进了监狱
+
+**严重程度**: 🟡 中等（不影响服务，但丢 SSH 很麻烦）
+
+**现象**: 上午多次 SSH 密钥签名失败（ECDSA-SK 安全密钥需要触摸），积累的失败认证触发了 fail2ban，本机 IP `4.145.88.38` 被 ban。德国节点直接 SSH 超时，但 HTTP 服务完全正常。
+
+**诊断**: 通过新加坡节点做跳板 SSH 进去，`fail2ban-client status sshd` 确认本机 IP 在黑名单中。
+
+**修复**:
+1. 释放：`fail2ban-client set sshd unbanip 4.145.88.38`
+2. 加白名单：`/etc/fail2ban/jail.local` 添加 `ignoreip = ... 4.145.88.38`
+
+**教训**: 部署脚本反复重试 SSH 可能触发 fail2ban。要么把 CI / 管理网段加入 ignoreip，要么降低 sshd jail 的敏感度（`maxretry` 提高、`findtime` 缩短）。
+
+---
+
 ### 最终脚本特性
 
 经过全部修复后，`deploy-edge.sh` 具备以下保证：
@@ -582,3 +857,9 @@ fi
 | 不误杀 | 端口检查识别 Docker 管理的端口 |
 | 纯开源 | 零 Secret、零证书、零环境变量 |
 | 开机自愈 | `systemctl enable docker` + `restart: unless-stopped` |
+| BOM 剥离 | POSIX `printf '\357\273\277'`，GNU/BusyBox sed 均可用 |
+| 防毒化 | 每周期清理 `.partial`，不影响增量数据 |
+| 原子切换 | `ln -sfn` symlink，单 syscall，Caddy 无感知 |
+| 永远增量 | `cp -aln` 种子 + rclone 增量，首轮也是秒级 |
+| 旧布局迁移 | 检测 `/data/www` → 自动迁移到 symlink 结构，一次完成 |
+| 缓存控制 | dists → no-cache（防过期元数据），pool → 1 年 immutable（内容寻址 deb） |

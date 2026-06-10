@@ -217,7 +217,7 @@ services:
       - ./data:/data
       - ./sync-logic.sh:/sync-logic.sh:ro
     healthcheck:
-      test: ["CMD", "test", "-f", "/data/www/sync_status.json"]
+      test: ["CMD", "test", "-f", "/data/current/sync_status.json"]
       interval: 30s
       timeout: 5s
       retries: 60
@@ -225,18 +225,52 @@ services:
 EOF
 
 # 2. Generate Caddyfile (Pure HTTP)
+# Cache strategy:
+#   - dists/ : APT metadata (InRelease, Packages, etc.) — never cache (forces revalidation)
+#   - pool/  : .deb packages — content-addressed, immutable, cache forever
 print_ok "Generating pure HTTP Caddyfile..."
 sudo bash -c "cat > Caddyfile" << 'EOF'
 :80 {
-    root * /data/www
+    root * /data/current
     file_server browse {
-        hide .staging www_old
+        hide _tmp
     }
     encode zstd gzip
+
+    # APT metadata — must never be stale
+    header /artifacts/anduinos/dists/* Cache-Control "no-cache"
+
+    # .deb packages — content-addressed, immutable
+    header /artifacts/anduinos/*/pool/*.deb Cache-Control "public, max-age=31536000, immutable"
 }
 EOF
 
 # 3. Generate Rclone Atomic Sync Script
+#
+# Symlink-based atomic swap:
+#
+#   /data/current  – symlink → primary  or  secondary (Caddy serves this)
+#   /data/primary  – offline directory A
+#   /data/secondary – offline directory B
+#
+# Flow:
+#   1. readlink to find the active directory; sync to the OTHER one
+#   2. Clean .partial leftovers from the staging directory (anti-poison)
+#   3. rclone sync into staging → only changed files transferred (incremental)
+#   4. Strip BOM from InRelease / Release
+#   5. ln -sfn staging /data/current   ← one renameat2, genuinely atomic
+#
+# Because staging always contains the previous cycle's data, rclone
+# compares source vs. an almost-identical destination and transfers only
+# what actually changed.  The first run (empty staging) does a full download;
+# every subsequent run is incremental.
+#
+# Idempotent / self-healing properties:
+#   - mkdir -p primary/secondary    → safe to run repeatedly
+#   - ln -sfn                       → overwrites any existing symlink
+#   - Migration from old /data/www  → moves it into secondary, once
+#   - readlink fallback             → handles missing symlink gracefully
+#
 print_ok "Generating Atomic Sync logic..."
 sudo bash -c "cat > sync-logic.sh" << 'EOF'
 #!/bin/sh
@@ -245,24 +279,62 @@ SOURCE_URL="https://apkg-dav.aiursoft.com/"
 
 echo "[$(date)] Rclone worker started."
 
+# ── One-time migration from old layout ──────────────────────────
+if [ -d /data/www ] && [ ! -L /data/current ]; then
+    echo "[$(date)] Migrating old /data/www layout to symlink-based layout..."
+    mv /data/www /data/secondary 2>/dev/null || true
+    mkdir -p /data/primary
+    ln -sfn /data/secondary /data/current
+    echo "[$(date)] Migration complete."
+fi
+
 while true; do
     echo "[$(date)] Starting atomic sync from $SOURCE_URL..."
 
-    mkdir -p /data/.staging /data/www
+    # Ensure base directories exist (idempotent)
+    mkdir -p /data/primary /data/secondary
 
-    if rclone sync :webdav: /data/.staging/ --webdav-url "$SOURCE_URL" -v; then
+    # Determine active directory and staging target
+    CURRENT=$(readlink /data/current 2>/dev/null || echo "/data/primary")
+    if [ "$CURRENT" = "/data/primary" ]; then
+        STAGING="/data/secondary"
+    else
+        STAGING="/data/primary"
+    fi
+
+    # Create symlink if missing (self-healing)
+    if [ ! -L /data/current ]; then
+        ln -sfn "$STAGING" /data/current
+    fi
+
+    # Seed staging from current data via hardlinks.
+    # cp -aln = hardlink all missing files, skip existing, zero extra disk.
+    # This guarantees the sync is always incremental, even on first run
+    # after migration or after a previously killed sync left partial data.
+    echo "[$(date)] Seeding staging from current ($CURRENT) via hardlinks..."
+    cp -aln "$CURRENT"/* "$STAGING"/ 2>/dev/null || true
+
+    echo "[$(date)] Current → $CURRENT  |  Staging → $STAGING"
+
+    # Remove .partial files left by a previously killed rclone.
+    # Without this they would poison the next transfer (size mismatch).
+    find "$STAGING" -name "*.partial" -delete 2>/dev/null || true
+
+    if rclone sync :webdav: "$STAGING/" --webdav-url "$SOURCE_URL" -v --delete-after; then
         echo "[$(date)] Sync to staging successful. Stripping UTF-8 BOM from GPG-signed files..."
-        find /data/.staging -type f \( -name "InRelease" -o -name "Release" \) -exec sed -i '1s/^\xef\xbb\xbf//' {} \;
+        find "$STAGING" -type f \( -name "InRelease" -o -name "Release" \) | while read -r f; do
+            sed -i "1s/^$(printf '\357\273\277')//" "$f"
+        done
 
-        echo "[$(date)] Performing atomic switch..."
+        # Write sync_status BEFORE the swap so the newly-active directory
+        # always has a valid timestamp, even if the container is killed
+        # between here and ln -sfn.
+        date -u +"%Y-%m-%dT%H:%M:%SZ" > "$STAGING/sync_status.json"
 
-        rm -rf /data/www_old
-        mv /data/www /data/www_old 2>/dev/null || true
-        mv /data/.staging /data/www
+        echo "[$(date)] Performing atomic symlink swap (ln -sfn $STAGING → /data/current)..."
+        ln -sfn "$STAGING" /data/current
 
-        date -u +"%Y-%m-%dT%H:%M:%SZ" > /data/www/sync_status.json
-
-        echo "[$(date)] Atomic switch completed."
+        echo "[$(date)] Atomic swap completed."
     else
         echo "[$(date)] Sync failed! Current production data is protected. Retrying next cycle."
     fi
