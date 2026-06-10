@@ -277,19 +277,39 @@ sudo bash -c "cat > sync-logic.sh" << 'EOF'
 
 SOURCE_URL="https://apkg-dav.aiursoft.com/"
 
-echo "[$(date)] Rclone worker started."
+echo "[$(date)] [INIT] Rclone worker started."
 
 # ── One-time migration from old layout ──────────────────────────
 if [ -d /data/www ] && [ ! -L /data/current ]; then
-    echo "[$(date)] Migrating old /data/www layout to symlink-based layout..."
+    echo "[$(date)] [MIGRATE] Moving old /data/www → /data/secondary..."
     mv /data/www /data/secondary 2>/dev/null || true
     mkdir -p /data/primary
     ln -sfn /data/secondary /data/current
-    echo "[$(date)] Migration complete."
+    echo "[$(date)] [MIGRATE] Done."
 fi
 
 while true; do
-    echo "[$(date)] Starting atomic sync from $SOURCE_URL..."
+    echo "[$(date)] [CYCLE] Starting sync cycle..."
+
+    # ── Mutual exclusion ─────────────────────────────────────────
+    # Prevent two sync processes from writing to the same staging
+    # directory simultaneously (e.g. docker exec + main loop).
+    # The lock fd is released automatically by the kernel on exit.
+    #
+    # BusyBox flock does not support -w; we implement our own
+    # wait loop with -n (non-blocking).
+    exec 200>/tmp/sync.lock
+    LOCK_WAITED=0
+    while ! flock -n 200 2>/dev/null; do
+        sleep 10
+        LOCK_WAITED=$((LOCK_WAITED + 10))
+        if [ $LOCK_WAITED -ge 7200 ]; then
+            echo "[$(date)] [LOCK] Timed out (2h). Skipping this cycle."
+            exec 200>&-
+            continue 2
+        fi
+    done
+    echo "[$(date)] [LOCK] Acquired (waited ${LOCK_WAITED}s)."
 
     # Ensure base directories exist (idempotent)
     mkdir -p /data/primary /data/secondary
@@ -304,42 +324,43 @@ while true; do
 
     # Create symlink if missing (self-healing)
     if [ ! -L /data/current ]; then
+        echo "[$(date)] [HEAL] Symlink missing — recreating."
         ln -sfn "$STAGING" /data/current
     fi
 
+    echo "[$(date)] [LAYOUT] Current → $CURRENT  |  Staging → $STAGING"
+
     # Seed staging from current data via hardlinks.
-    # cp -aln = hardlink all missing files, skip existing, zero extra disk.
-    # This guarantees the sync is always incremental, even on first run
-    # after migration or after a previously killed sync left partial data.
-    echo "[$(date)] Seeding staging from current ($CURRENT) via hardlinks..."
+    echo "[$(date)] [SEED] Hardlinking missing files from current to staging..."
     cp -aln "$CURRENT"/* "$STAGING"/ 2>/dev/null || true
 
-    echo "[$(date)] Current → $CURRENT  |  Staging → $STAGING"
-
     # Remove .partial files left by a previously killed rclone.
-    # Without this they would poison the next transfer (size mismatch).
+    echo "[$(date)] [CLEAN] Removing leftover .partial files..."
     find "$STAGING" -name "*.partial" -delete 2>/dev/null || true
 
+    echo "[$(date)] [RCLONE] Starting rclone sync..."
     if rclone sync :webdav: "$STAGING/" --webdav-url "$SOURCE_URL" -v --delete-after; then
-        echo "[$(date)] Sync to staging successful. Stripping UTF-8 BOM from GPG-signed files..."
+        echo "[$(date)] [RCLONE] Done."
+
+        echo "[$(date)] [BOM] Stripping UTF-8 BOM from InRelease / Release..."
         find "$STAGING" -type f \( -name "InRelease" -o -name "Release" \) | while read -r f; do
             sed -i "1s/^$(printf '\357\273\277')//" "$f"
         done
 
-        # Write sync_status BEFORE the swap so the newly-active directory
-        # always has a valid timestamp, even if the container is killed
-        # between here and ln -sfn.
         date -u +"%Y-%m-%dT%H:%M:%SZ" > "$STAGING/sync_status.json"
 
-        echo "[$(date)] Performing atomic symlink swap (ln -sfn $STAGING → /data/current)..."
+        echo "[$(date)] [SWAP] ln -sfn $STAGING → /data/current..."
         ln -sfn "$STAGING" /data/current
 
-        echo "[$(date)] Atomic swap completed."
+        echo "[$(date)] [SWAP] Done. Sync cycle complete."
     else
-        echo "[$(date)] Sync failed! Current production data is protected. Retrying next cycle."
+        echo "[$(date)] [FAIL] rclone exited non-zero. Production data NOT touched."
     fi
 
-    echo "[$(date)] Sleeping for 1 hour..."
+    # Release lock
+    exec 200>&-
+
+    echo "[$(date)] [SLEEP] 1 hour..."
     sleep 3600
 done
 EOF
@@ -351,6 +372,12 @@ sudo chmod +x sync-logic.sh
 print_ok "Pulling latest images and launching services..."
 sudo docker compose pull
 sudo docker compose up -d
+
+# Force-restart containers so they pick up volume-mount scripts
+# (sync-logic.sh, Caddyfile) even when docker-compose.yml itself
+# hasn't changed.  docker compose up -d only recreates containers
+# on compose-file changes, not on mounted-file changes.
+sudo docker restart anduinos_sync anduinos_caddy 2>/dev/null || true
 judge "Docker Compose services started"
 
 #==========================
