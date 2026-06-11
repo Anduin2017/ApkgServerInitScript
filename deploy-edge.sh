@@ -233,7 +233,7 @@ sudo bash -c "cat > Caddyfile" << 'EOF'
 :80 {
     root * /data/current
     file_server browse {
-        hide _tmp
+        hide _tmp .prev .partial .tmp
     }
     encode zstd gzip
 
@@ -334,15 +334,16 @@ while true; do
     echo "[$(date)] [SEED] Hardlinking missing files from current to staging..."
     cp -aln "$CURRENT"/* "$STAGING"/ 2>/dev/null || true
 
-    # Remove .partial files left by a previously killed rclone.
-    echo "[$(date)] [CLEAN] Removing leftover .partial files..."
-    find "$STAGING" -name "*.partial" -delete 2>/dev/null || true
+    # Remove .partial/.prev files left by a previously killed rclone or
+    # synced from the source's own staging directory.
+    echo "[$(date)] [CLEAN] Removing leftover .partial and .prev files..."
+    find "$STAGING" \( -name "*.partial" -o -name ".prev" \) -exec rm -rf {} + 2>/dev/null || true
 
     echo "[$(date)] [RCLONE] Starting rclone sync..."
     # --inplace=false (the default for local) forces write-to-tmp + rename,
     # which breaks any hardlink from cp -aln.  If a file is updated, the
     # old inode in $CURRENT is untouched until the symlink swap.
-    if rclone sync :webdav: "$STAGING/" --webdav-url "$SOURCE_URL" -v --delete-after --inplace=false; then
+    if rclone sync :webdav: "$STAGING/" --webdav-url "$SOURCE_URL" -v --delete-after --inplace=false --exclude ".prev/**" --exclude ".partial/**"; then
         echo "[$(date)] [RCLONE] Done."
 
         echo "[$(date)] [BOM] Stripping UTF-8 BOM from InRelease / Release..."
