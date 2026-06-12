@@ -339,26 +339,43 @@ while true; do
     echo "[$(date)] [CLEAN] Removing leftover .partial and .prev files..."
     find "$STAGING" \( -name "*.partial" -o -name ".prev" \) -exec rm -rf {} + 2>/dev/null || true
 
-    echo "[$(date)] [RCLONE] Starting rclone sync..."
+    # Force re-download of APT metadata files.  Hardlink-seeded copies
+    # can match the new file's size exactly (only internal checksums
+    # differ), which fools rclone's default mtime+size comparison.
+    echo "[$(date)] [CLEAN] Purging cached InRelease / Release..."
+    find "$STAGING" -type f \( -name "InRelease" -o -name "Release" \) -delete 2>/dev/null || true
+
+    echo "[$(date)] [RCLONE] Starting rclone sync (pass 1)..."
     # --inplace=false (the default for local) forces write-to-tmp + rename,
     # which breaks any hardlink from cp -aln.  If a file is updated, the
     # old inode in $CURRENT is untouched until the symlink swap.
     if rclone sync :webdav: "$STAGING/" --webdav-url "$SOURCE_URL" -v --delete-after --inplace=false --exclude ".prev/**" --exclude ".partial/**"; then
-        echo "[$(date)] [RCLONE] Done."
+        echo "[$(date)] [RCLONE] Pass 1 done."
 
-        echo "[$(date)] [BOM] Stripping UTF-8 BOM from InRelease / Release..."
-        find "$STAGING" -type f \( -name "InRelease" -o -name "Release" \) | while read -r f; do
-            sed -i "1s/^$(printf '\357\273\277')//" "$f"
-        done
+        # Pause to let the source finish any in-progress atomic
+        # update (Packages.gz written, InRelease not yet re-signed).
+        sleep 10
 
-        date -u +"%Y-%m-%dT%H:%M:%SZ" > "$STAGING/sync_status.json"
+        echo "[$(date)] [RCLONE] Starting rclone sync (pass 2)..."
+        if rclone sync :webdav: "$STAGING/" --webdav-url "$SOURCE_URL" -v --delete-after --inplace=false --exclude ".prev/**" --exclude ".partial/**"; then
+            echo "[$(date)] [RCLONE] Pass 2 done."
 
-        echo "[$(date)] [SWAP] ln -sfn $STAGING → /data/current..."
-        ln -sfn "$STAGING" /data/current
+            echo "[$(date)] [BOM] Stripping UTF-8 BOM from InRelease / Release..."
+            find "$STAGING" -type f \( -name "InRelease" -o -name "Release" \) | while read -r f; do
+                sed -i "1s/^$(printf '\357\273\277')//" "$f"
+            done
 
-        echo "[$(date)] [SWAP] Done. Sync cycle complete."
+            date -u +"%Y-%m-%dT%H:%M:%SZ" > "$STAGING/sync_status.json"
+
+            echo "[$(date)] [SWAP] ln -sfn $STAGING → /data/current..."
+            ln -sfn "$STAGING" /data/current
+
+            echo "[$(date)] [SWAP] Done. Sync cycle complete."
+        else
+            echo "[$(date)] [FAIL] rclone pass 2 exited non-zero. Production data NOT touched."
+        fi
     else
-        echo "[$(date)] [FAIL] rclone exited non-zero. Production data NOT touched."
+        echo "[$(date)] [FAIL] rclone pass 1 exited non-zero. Production data NOT touched."
     fi
 
     # Release lock

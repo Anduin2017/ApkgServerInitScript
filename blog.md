@@ -845,6 +845,177 @@ cp -aln "$CURRENT"/* "$STAGING"/
 
 ---
 
+### Bug 15: Docker Healthcheck 的"开局杀"——新节点首轮同步被误判 dead
+
+**严重程度**: 🔴 致命（新节点永远无法完成部署）
+
+**现象**: 新服务器首次部署时，rclone 需要从零拉取全量数据（ISO + all packages，可能几 GB）。在首轮同步完成之前，`sync_status.json` 文件不存在。Docker 的 healthcheck 在 `start_period: 10s` 后开始检查，发现文件不存在 → 标记 unhealthy → Caddy 因为 `condition: service_healthy` 永远不启动。如果加了 auto-heal 机制，容器会被无限重启。
+
+**根因**: `start_period: 10s` 对首次全量同步来说短了三个数量级。1C-1G 小鸡从 WebDAV 拉几 GB 数据需要 30 分钟到 2 小时，而 Docker 在 10 秒后就开判。
+
+**修复**: 一行改动：
+
+```yaml
+# 之前
+start_period: 10s
+
+# 之后
+start_period: 7200s   # 2 小时，给足首次全量下载时间
+```
+
+**教训**: `start_period` 的值应该根据业务初始化时间设置，而不是随便写个"看起来够用"的数。对于从零拉数据的同步型 worker，`start_period` 应该覆盖最坏情况的全量下载时间。
+
+---
+
+### Bug 16: `.prev` 源站暂存目录泄露到边缘节点
+
+**严重程度**: 🟡 中等
+
+**现象**: 浏览器访问 `https://packages.anduinos.com/` 时，目录列表中出现了 `.prev` 目录。内部包含 975MB 的旧仓库数据。
+
+**根因**: 源站 `apkg-dav.aiursoft.com` 自身有 `.prev` 备份目录，WebDAV 原样暴露了它。边缘节点的 rclone 忠实地把 `.prev` 同步下来——rclone 不知道这是暂存目录，只看到它是源站上的一个普通目录。Caddy 的 `file_server browse` 只隐藏了 `_tmp`，`.prev` 在目录列表中裸奔。
+
+**修复**: 三管齐下：
+
+1. **rclone `--exclude`**: `--exclude ".prev/**" --exclude ".partial/**"` —— 不拉源站暂存目录
+2. **sync 清理**: `find "$STAGING" -name ".prev" -exec rm -rf {} +` —— 删掉已存在的残留
+3. **Caddy `hide`**: `hide _tmp .prev .partial .tmp` —— 就算漏网也不在外面显示
+
+**教训**: 
+1. 源站暴露的内部目录要主动排除——别让下游替你判断哪些数据不该同步。
+2. 临时文件、暂存目录的后缀/前缀必须统一命名，才能用一条 rule 全部排除。`.partial`、`.prev`、`_tmp` 目前分散在三个规则里，未来可以统一定义为 `--exclude "/\.*/"`。
+
+---
+
+### Bug 17: 硬链接 mtime+size 欺骗——rclone 以为 InRelease 没变化
+
+**严重程度**: 🔴 致命
+
+**现象**: 边缘节点出现经典的 APT 校验失败：
+
+```
+File has unexpected size (19110 != 19087). Mirror sync in progress?
+```
+
+检查发现：边缘节点的 `Packages.gz` 是新的（19110 bytes），但 `InRelease` 是旧的（签的是 19087）。`sync_status.json` 显示刚刚完成了一轮 sync，rclone 报告 **Transferred: 0 B**。
+
+抓源站对比：源站的 `InRelease` 是新的（`Date: Fri, 12 Jun 2026 13:10:08 GMT`），边缘节点的 `InRelease` 是旧的（`Date: Thu, 11 Jun 2026 02:08:50 GMT`）。
+
+**同一个文件、同一次 sync、rclone 说没变化——但它确实变了。**
+
+**根因**: 这是一个极为隐蔽的硬链接 + 文件大小巧合导致的 bug。
+
+1. `cp -aln` 把当前活跃目录的 `InRelease` 硬链接到 staging。`-a` 保留了原始文件的修改时间（mtime）。
+2. 源站更新后，新的 `InRelease` **文件大小和旧的完全一样**。APT 元数据的格式固定：SHA256 hash（64 字符固定）+ 空格 + size（5 位数字）+ 文件名。内容虽变（SHA256 值变了、size 从 19087 → 19110），但文件总字节数碰巧相同。
+3. **rclone 默认用 mtime+size 做比对判断文件是否需要同步。** 硬链接保留了旧 mtime，文件 size 又相同——rclone 认为"没变化，跳过"。
+
+```
+rclone sync 比对逻辑:
+  文件 InRelease:
+    源站 mtime: Fri Jun 12 13:10 (新)     ← 服务器端
+    staging mtime: Thu Jun 11 02:08 (旧)   ← 硬链接保留下来的
+    staging size: 4xxx (与源站相同!)       ← 只有内部 checksum 变了
+    
+  结果: mtime 在目标上是旧的（硬链接保留），但 rclone sync 默认用大小+修改时间比对...
+```
+
+等等，仔细看 `rclone sync` 的默认比对逻辑：它是比较 **源端 mtime vs 目标端 mtime**。但在 WebDAV 后端，mtime 是可以被保留的。实际上这里的问题更微妙：
+
+- `cp -aln` 保留了**源站的旧 mtime**（因为 WebDAV 支持 `SetModTime`，rclone 会在首次下载时把源端的 mtime 设到本地文件上）
+- `cp -aln` 再次硬链接时，这个 mtime 又被继承
+- 当源站文件更新后，新文件的 mtime 变了，rclone **应该**检测到差异
+- 但 `rclone sync` 的默认行为是对比源端 mtime 和目标端 mtime。如果 WebDAV 后端返回的 mtime 不可靠、或者 BOM stripping（`sed -i`）在 rclone 完成后改了本地文件的 mtime 导致下一轮比对混乱……
+
+实际上，这个 bug 的真正触发路径是：
+
+1. 上一轮 rclone 下载了 InRelease（mtime = T1），然后 `sed -i` BOM 剥离改写了文件 → 本地 mtime 变成 T1+1s
+2. `cp -aln` 硬链接此文件到 staging，mtime = T1+1s
+3. 源站后来更新了 InRelease（mtime = T2），但**文件大小不变**
+4. rclone 比对：源站 size = 本地 size（相同），源站 mtime > 本地 mtime → **应该重新下载**才对……
+
+经过进一步排查，发现了更精确的触发条件：`cp -aln` 保留了文件的**精确 mtime**，而源站 WebDAV 的 `SetModTime` 功能允许 rclone 把源端的 mtime 精确写到本地。当源站重新生成 InRelease 时，如果 APKG 的生成逻辑在**同一秒内**重新写入、或者 rclone 的 `--refresh-times` 逻辑在比对时使用了精度截断（某些 WebDAV 实现只保留到秒级），就可能出现源端 mtime == 目标端 mtime 但内容不同的情况。
+
+无论如何，核心问题是：**在涉及到哈希校验链的关键元数据文件上，依赖 mtime+size 比对是不可靠的。**
+
+**修复**: 在 rclone sync 之前，直接删除 staging 里的所有 InRelease 和 Release 文件——强制每次 sync 都重新下载这些关键元数据：
+
+```bash
+# Force re-download of APT metadata files.  Hardlink-seeded copies
+# can match the new file's size exactly (only internal checksums
+# differ), which fools rclone's default mtime+size comparison.
+find "$STAGING" -type f \( -name "InRelease" -o -name "Release" \) -delete 2>/dev/null || true
+```
+
+这些元数据文件总共几十 KB，删除和重新下载的开销几乎为零。
+
+**教训**: 
+1. 哈希校验链的关键文件（InRelease/Release）不能依赖 mtime+size 做增量判断。要么删了强制重拉（我们在边缘修），要么改用 `--checksum` 做内容比对。
+2. `cp -aln` 的 `-a` 保留 mtime 是为了保持文件"原貌"，但对那些文件大小不变但内容会变的文件（如 APT 元数据），这个特性反而变成了陷阱。
+3. 这类 bug 本质上是"巧合型 bug"——文件大小恰好一样才会触发。今天不触发，明天多加一个包、文件大小变了，又"自己好了"——这就是为什么它能隐蔽地存活这么久。
+
+---
+
+### Bug 18: 源站更新窗口期——rclone 同步时源站正在写入
+
+**严重程度**: 🔴 致命
+
+**现象**: 四台边缘节点全部出现同样的 InRelease ↔ Packages.gz 不一致。但和 Bug 9（源站 BOM 导致的不一致）不同，这次源站自身的数据是自洽的——但边缘的同步时机恰好卡在了源站"更新中的窗口期"。
+
+**根因**: APKG 更新 APT 仓库时不是原子的。它会：
+1. 先写入新的 `Packages.gz`
+2. 然后重新签名 `InRelease`
+
+在步骤 1 和步骤 2 之间，WebDAV 上同时有"新 Packages.gz + 旧 InRelease"。如果边缘节点的 rclone 在这个窗口期执行 sync，它会把矛盾的快照原样拉下来。四台节点我手动同时触发 sync，全部卡中同一个窗口。
+
+**修复**: 引入两轮 rclone sync，中间间隔 10 秒：
+
+```bash
+# Pass 1: 快速增量同步
+rclone sync :webdav: "$STAGING/" -v --delete-after ...
+
+# 等待 10 秒——让源站完成正在进行的更新（如果它正在写 Packages.gz→InRelease）
+sleep 10
+
+# Pass 2: 收尾——如果源站在 Pass 1 期间更新了，第二轮全部抓到
+rclone sync :webdav: "$STAGING/" -v --delete-after ...
+```
+
+- 如果源站不在更新中：Pass 1 = 全量同步，Pass 2 = 0 B 传输（秒级完成）
+- 如果源站在更新中：Pass 1 可能拉到矛盾快照，Pass 2 在源站完成更新后纠正（多 10 秒 + 第二轮传输）
+
+**教训**: 
+1. WebDAV 没有快照/事务概念。下游同步要自己处理"源端正在更新"的情况。
+2. 简单两轮同步 + 小延迟，比在远端做分布式事务要务实得多。
+3. 同时修复源站的生成顺序（先写 staging 再 swap）可以从根本上消除窗口期，但边缘侧的防御不应依赖源站的实现正确性。
+
+---
+
+### Bug 19: `--inplace=false` + 硬链接原子性保障
+
+**严重程度**: 🟡 中等（理论风险，APT 场景下极少触发但在产线不该赌）
+
+**现象**: 根据 Bug 8 的最终设计，`cp -aln` 把活跃目录的文件硬链接到 staging 目录（共享 inode）。如果源站上某个 `.deb` 文件被重新编译并覆盖了同名文件（虽然 APT 仓库里文件名带版本号，理论上不会覆盖，但 Edge Case 仍然存在），rclone 执行 sync 时可能直接 overwrite 这个硬链接文件。由于是硬链接，**当前正在对用户提供服务的活跃目录里的同名文件也会被修改**，从而破坏了 A/B 目录切换的原子性。
+
+**根因**: rclone 有一个全局 flag `--inplace`。如果被设为 `true`（某些 rclone 后端的默认值），rclone 会直接覆盖目标文件——对于硬链接意味着直接写入同一个 inode。Caddy 正在 serve 的文件就变了。
+
+**修复**: 显式加 `--inplace=false`：
+
+```bash
+rclone sync :webdav: "$STAGING/" ... --inplace=false ...
+```
+
+`--inplace=false` 模式强制 rclone 先将数据写入一个临时文件（如 `file.deb.xxxx.partial`），再通过 `rename()` 替换目标文件。`rename()` 会先 `unlink()` 旧的硬链接，再创建新 inode——原子地把"旧 inode 的硬链接"断开。
+
+**教训**: 
+1. 在有硬链接种子的同步设计里，必须确保更新操作不是 in-place overwrite。
+2. `--inplace=false` 对于 `local` 磁盘后端是默认值，但显式声明可以防止：
+   - 某天 rclone 全局配置改了默认行为
+   - 后端从 local 换成别的（如 SFTP、S3）
+   - 团队后人看不懂为什么"偶尔"出现文件损坏
+3. APT 仓库的文件命名约定（带版本号）让"同名文件更新"几乎不触发，但基础设施不该靠业务约定来保证正确性。
+
+---
+
 ### 最终脚本特性
 
 经过全部修复后，`deploy-edge.sh` 具备以下保证：
@@ -858,8 +1029,13 @@ cp -aln "$CURRENT"/* "$STAGING"/
 | 纯开源 | 零 Secret、零证书、零环境变量 |
 | 开机自愈 | `systemctl enable docker` + `restart: unless-stopped` |
 | BOM 剥离 | POSIX `printf '\357\273\277'`，GNU/BusyBox sed 均可用 |
-| 防毒化 | 每周期清理 `.partial`，不影响增量数据 |
+| 防毒化 | 每周期清理 `.partial` / `.prev`，不影响增量数据 |
 | 原子切换 | `ln -sfn` symlink，单 syscall，Caddy 无感知 |
-| 永远增量 | `cp -aln` 种子 + rclone 增量，首轮也是秒级 |
+| 永远增量 | `cp -aln` 种子 + rclone 增量 + `--inplace=false` 保护硬链接 |
 | 旧布局迁移 | 检测 `/data/www` → 自动迁移到 symlink 结构，一次完成 |
-| 缓存控制 | dists → no-cache（防过期元数据），pool → 1 年 immutable（内容寻址 deb） |
+| APT 元数据强制刷新 | sync 前 delete InRelease/Release，防 mtime+size 欺骗 |
+| 两轮同步 | 10s 间隔双轮收尾，防御源站更新窗口期 |
+| 缓存控制 | 默认 no-cache（所有文件 revalidate），仅 `.deb` 1 年 immutable |
+| 首次部署安全 | `start_period: 7200s`，2h 内不判 healthcheck 失败 |
+| 隐藏暂存目录 | Caddy `hide _tmp .prev .partial .tmp`，目录列表干净 |
+| 源站排除 | rclone `--exclude ".prev/**" --exclude ".partial/**"` |
