@@ -336,8 +336,8 @@ while true; do
     echo "[$(date)] [LAYOUT] Current → $CURRENT  |  Staging → $STAGING"
 
     # Seed staging from current data via hardlinks.
-    echo "[$(date)] [SEED] Hardlinking missing files from current to staging..."
-    cp -aln "$CURRENT"/* "$STAGING"/ 2>/dev/null || true
+    echo "[$(date)] [SEED] Hardlinking files from current to staging..."
+    cp -al "$CURRENT"/* "$STAGING"/ 2>/dev/null || true
 
     # Remove .partial/.prev files left by a previously killed rclone or
     # synced from the source's own staging directory.
