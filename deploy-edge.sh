@@ -423,12 +423,44 @@ while true; do
             sed -i "1s/^$(printf '\357\273\277')//" "$f"
         done
 
-        date -u +"%Y-%m-%dT%H:%M:%SZ" > "$STAGING/sync_status.json"
+        # ── Hash-chain integrity verification ──────────────────────
+        # Before swapping, verify that every file listed in each
+        # InRelease SHA256 section actually matches its attested hash.
+        # This is the ULTIMATE safety net — if anything (mtime+size
+        # deception, partial transfer, source inconsistency, rclone
+        # bug) produced stale or corrupted metadata, we catch it here
+        # and REFUSE to swap.  The currently-serving data stays live.
+        echo "[$(date)] [VERIFY] Checking APT hash chain integrity..."
+        VERIFY_FAILED=0
+        for inrelease in "$STAGING"/artifacts/anduinos/dists/*/InRelease; do
+            [ -f "$inrelease" ] || continue
+            dist_dir=$(dirname "$inrelease")
+            awk '/^SHA256:/{found=1; next} /^-----BEGIN/{found=0} found && NF>=3{print $1,$3}' "$inrelease" | while read -r expected file; do
+                target="$dist_dir/$file"
+                if [ -f "$target" ]; then
+                    actual=$(sha256sum "$target" | awk '{print $1}')
+                    if [ "$expected" != "$actual" ]; then
+                        echo "[$(date)] [VERIFY] MISMATCH: $file (exp=${expected}, got=${actual})"
+                        echo "FAIL" >/tmp/verify_result
+                    fi
+                fi
+            done
+            if [ -f /tmp/verify_result ]; then
+                VERIFY_FAILED=1
+                rm -f /tmp/verify_result
+                break
+            fi
+        done
 
-        echo "[$(date)] [SWAP] ln -sfn $STAGING → /data/current..."
-        ln -sfn "$STAGING" /data/current
-
-        echo "[$(date)] [SWAP] Done. Sync cycle complete."
+        if [ $VERIFY_FAILED -eq 1 ]; then
+            echo "[$(date)] [FAIL] Hash chain verification failed — refusing to swap."
+        else
+            echo "[$(date)] [VERIFY] Hash chain OK."
+            date -u +"%Y-%m-%dT%H:%M:%SZ" > "$STAGING/sync_status.json"
+            echo "[$(date)] [SWAP] ln -sfn $STAGING → /data/current..."
+            ln -sfn "$STAGING" /data/current
+            echo "[$(date)] [SWAP] Done. Sync cycle complete."
+        fi
     else
         echo "[$(date)] [FAIL] Sync cycle failed. Production data NOT touched."
     fi
