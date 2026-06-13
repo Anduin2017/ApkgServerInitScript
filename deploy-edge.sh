@@ -341,51 +341,96 @@ while true; do
 
     # Force re-download of ALL APT metadata files in the hash chain.
     #
-    #   InRelease → Release → Packages / Packages.* → .deb
+    #   InRelease → Release → Packages / Packages.* →
+    #   Contents-* / Contents-*.gz → Sources / Sources.* → .deb
     #
     # Hardlink-seeded copies can match the new file's size exactly
     # (only internal checksums differ), which fools rclone's default
     # mtime+size comparison.  Every file in this chain is vulnerable —
-    # a stale Packages file that happens to have the same byte count as
-    # the new one will pass rclone's check but fail apt's hash-chain
-    # verification (InRelease attests to a different SHA256).
+    # a stale Packages or Contents file that happens to have the same
+    # byte count as the new one will pass rclone's check but fail apt's
+    # hash-chain verification (InRelease attests to a different SHA256).
     #
     # These files are tiny (KB range) — purging is cheap; stale
     # metadata is catastrophic (apt update rejects the whole repo).
-    echo "[$(date)] [CLEAN] Purging cached APT metadata (InRelease / Release / Packages)..."
-    find "$STAGING" -type f \( -name "InRelease" -o -name "Release" -o -name "Packages" -o -name "Packages.gz" -o -name "Packages.xz" -o -name "Packages.bz2" \) -delete 2>/dev/null || true
+    #
+    # Only .deb (pool/) and .iso (ISO/) are cached via hardlink seed;
+    # they are content-addressed and truly immutable.
+    echo "[$(date)] [CLEAN] Purging ALL cached APT metadata files..."
+    find "$STAGING" -type f \
+        \( -name "InRelease" -o -name "Release" \
+        -o -name "Packages" -o -name "Packages.gz" -o -name "Packages.xz" -o -name "Packages.bz2" \
+        -o -name "Contents-*" -o -name "Contents-*.gz" -o -name "Contents-*.xz" -o -name "Contents-*.bz2" \
+        -o -name "Sources" -o -name "Sources.gz" -o -name "Sources.xz" -o -name "Sources.bz2" \) \
+        -delete 2>/dev/null || true
 
-    echo "[$(date)] [RCLONE] Starting rclone sync (pass 1)..."
-    # --inplace=false (the default for local) forces write-to-tmp + rename,
-    # which breaks any hardlink from cp -aln.  If a file is updated, the
-    # old inode in $CURRENT is untouched until the symlink swap.
-    if rclone sync :webdav: "$STAGING/" --webdav-url "$SOURCE_URL" -v --delete-after --inplace=false --exclude ".prev/**" --exclude ".partial/**"; then
-        echo "[$(date)] [RCLONE] Pass 1 done."
+    # ── Two-pass rclone sync with retry ───────────────────────────
+    #
+    # The source may be updating its repository while we sync
+    # (Packages.gz written, InRelease not yet re-signed).  This
+    # causes "corrupted on transfer: sizes differ" errors — the
+    # file size changed between rclone's LIST and DOWNLOAD phases.
+    #
+    # Strategy: up to 3 attempts per pass, 30s backoff between
+    # retries, 10s gap between passes.  This gives the source time
+    # to finish any in-progress atomic update cycle.
+    SYNC_OK=true
+    MAX_ATTEMPTS=3
+    RETRY_GAP=30
 
-        # Pause to let the source finish any in-progress atomic
-        # update (Packages.gz written, InRelease not yet re-signed).
-        sleep 10
+    for PASS in 1 2; do
+        ATTEMPT=0
+        while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+            echo "[$(date)] [RCLONE] Pass $PASS, attempt $ATTEMPT/$MAX_ATTEMPTS..."
 
-        echo "[$(date)] [RCLONE] Starting rclone sync (pass 2)..."
-        if rclone sync :webdav: "$STAGING/" --webdav-url "$SOURCE_URL" -v --delete-after --inplace=false --exclude ".prev/**" --exclude ".partial/**"; then
-            echo "[$(date)] [RCLONE] Pass 2 done."
+            if rclone sync :webdav: "$STAGING/" \
+                --webdav-url "$SOURCE_URL" \
+                -v \
+                --delete-after \
+                --inplace=false \
+                --retries 3 \
+                --low-level-retries 3 \
+                --exclude ".prev/**" \
+                --exclude ".partial/**"; then
+                echo "[$(date)] [RCLONE] Pass $PASS done (attempt $ATTEMPT)."
+                break
+            else
+                if [ $ATTEMPT -lt $MAX_ATTEMPTS ]; then
+                    echo "[$(date)] [RCLONE] Pass $PASS failed, retrying in ${RETRY_GAP}s..."
+                    sleep $RETRY_GAP
+                else
+                    echo "[$(date)] [FAIL] rclone pass $PASS failed after $MAX_ATTEMPTS attempts."
+                    SYNC_OK=false
+                fi
+            fi
+        done
 
-            echo "[$(date)] [BOM] Stripping UTF-8 BOM from InRelease / Release..."
-            find "$STAGING" -type f \( -name "InRelease" -o -name "Release" \) | while read -r f; do
-                sed -i "1s/^$(printf '\357\273\277')//" "$f"
-            done
-
-            date -u +"%Y-%m-%dT%H:%M:%SZ" > "$STAGING/sync_status.json"
-
-            echo "[$(date)] [SWAP] ln -sfn $STAGING → /data/current..."
-            ln -sfn "$STAGING" /data/current
-
-            echo "[$(date)] [SWAP] Done. Sync cycle complete."
-        else
-            echo "[$(date)] [FAIL] rclone pass 2 exited non-zero. Production data NOT touched."
+        if [ "$SYNC_OK" = "false" ]; then
+            break
         fi
+
+        # Pause between passes to let source finish atomic updates.
+        if [ $PASS -eq 1 ]; then
+            echo "[$(date)] [RCLONE] Pausing 10s between Pass 1 and Pass 2..."
+            sleep 10
+        fi
+    done
+
+    if [ "$SYNC_OK" = "true" ]; then
+        echo "[$(date)] [BOM] Stripping UTF-8 BOM from InRelease / Release..."
+        find "$STAGING" -type f \( -name "InRelease" -o -name "Release" \) | while read -r f; do
+            sed -i "1s/^$(printf '\357\273\277')//" "$f"
+        done
+
+        date -u +"%Y-%m-%dT%H:%M:%SZ" > "$STAGING/sync_status.json"
+
+        echo "[$(date)] [SWAP] ln -sfn $STAGING → /data/current..."
+        ln -sfn "$STAGING" /data/current
+
+        echo "[$(date)] [SWAP] Done. Sync cycle complete."
     else
-        echo "[$(date)] [FAIL] rclone pass 1 exited non-zero. Production data NOT touched."
+        echo "[$(date)] [FAIL] Sync cycle failed. Production data NOT touched."
     fi
 
     # Release lock
