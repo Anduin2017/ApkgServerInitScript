@@ -372,9 +372,12 @@ while true; do
     # ── Two-pass rclone sync with retry ───────────────────────────
     #
     # The source may be updating its repository while we sync
-    # (Packages.gz written, InRelease not yet re-signed).  This
-    # causes "corrupted on transfer: sizes differ" errors — the
-    # file size changed between rclone's LIST and DOWNLOAD phases.
+    # (Packages.gz written, InRelease not yet re-signed).  Also, the
+    # WebDAV server (hacdias/webdav) may serve stale PROPFIND results
+    # where getcontentlength doesn't match the actual file — causing
+    # "corrupted on transfer: sizes differ".  --ignore-size skips the
+    # size check; correctness is guaranteed by the hash-chain
+    # verification step before swap (see [VERIFY] below).
     #
     # Strategy: up to 3 attempts per pass, 30s backoff between
     # retries, 10s gap between passes.  This gives the source time
@@ -394,6 +397,7 @@ while true; do
                 -v \
                 --delete-after \
                 --inplace=false \
+                --ignore-size \
                 --retries 3 \
                 --low-level-retries 3 \
                 --exclude ".prev/**" \
