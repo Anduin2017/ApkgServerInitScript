@@ -1089,3 +1089,90 @@ rclone sync :webdav: "$STAGING/" ... --inplace=false ...
 | 首次部署安全 | `start_period: 7200s`，2h 内不判 healthcheck 失败 |
 | 隐藏暂存目录 | Caddy `hide _tmp .prev .partial .tmp`，目录列表干净 |
 | 源站排除 | rclone `--exclude ".prev/**" --exclude ".partial/**"` |
+| 源站直连 | Caddy `file_server` 替代 WebDAV，消除 PROPFIND 缓存层 |
+| Hash-chain 验证 | swap 前解析 InRelease → 逐文件验证 SHA256 → 不匹配拒绝 swap |
+| 重试机制 | 每 pass 最多 3 次尝试，30s 间隔，防御源站更新窗口 |
+| 访问控制 | `apkg-dav` 灰云 + Caddy IP 白名单，仅边缘节点可直连 |
+| 持久化日志 | Docker json-file 10M×5 + `tee` 双写 `/data/sync.log` |
+
+---
+
+## 附录二：WebDAV 缓存灾难——一次完整的根因追踪
+
+2026年6月13日，四台边缘节点全部同步失败，哈希验证持续拒绝 swap。以下是从现象到根因到修复的完整记录。
+
+### Bug 20: `hacdias/webdav` 的 PROPFIND 在文件 swap 后返回过期 `getcontentlength`
+
+**严重程度**: 🔴 致命（所有节点持续失败）
+
+**现象**: 四台边缘节点同时报错：
+
+```
+corrupted on transfer: sizes differ src 19948 vs dst 19995
+```
+
+`--ignore-size` 绕过 rclone 的 size 校验后，哈希验证又发现 `InRelease` 和 `Packages.gz` 不匹配：
+
+```
+VERIFY MISMATCH: Packages.gz
+  expected: da34bb12... (from InRelease)
+  actual:   429f0e38... (on disk)
+```
+
+**第一层排查：怀疑源站更新窗口。** 但用户指出源站仅每 30 分钟更新一次元数据，不可能持续产生窗口期。
+
+**第二层排查：直连源站验证。** PROPFIND 返回 `getcontentlength: 19948`，但 HTTP GET 返回 `content-length: 19995`。同一个文件，WebDAV 协议说 19948，HTTP 协议说 19995。
+
+```
+curl -X PROPFIND → <D:getcontentlength>19948</D:getcontentlength>
+curl -sI         → content-length: 19995
+```
+
+**第三层排查：怀疑 Cloudflare 缓存。** 检查响应头：
+
+```
+cf-cache-status: HIT
+cache-control: max-age=14400
+age: 5119
+```
+
+Cloudflare 给 `apkg-dav` 设了 4 小时缓存！但这是**第二个问题**，不是根因。
+
+**第四层：SSH 到源站 (`31.56.26.15`)，检查磁盘文件。** 磁盘上数据**完全正确**——`InRelease` 和 `Packages.gz` 哈希一致，均为 `da34bb12...`。Caddy 容器内读取也是正确的。说明 Caddy `file_server` 工作正常。
+
+**根因确认：`hacdias/webdav` 的 PROPFIND 目录列表缓存。**
+
+APKG 通过 `rename(2)` 原子 swap `artifacts/` 目录后，WebDAV 进程仍在内存中缓存着旧 inode 的 `getcontentlength`。每次 PROPFIND 请求返回旧大小（19948），但 HTTP GET 返回实际文件（19995）。rclone `:webdav:` 后端先 PROPFIND 列目录，再 GET 下载——发现大小不一致 → 拒绝传输。
+
+```
+APKG → atomic swap → /export
+                        ↑
+              WebDAV 进程缓存了旧 PROPFIND
+              → getcontentlength 永久走偏
+              → rclone 永远无法完成同步
+```
+
+**终极修复：消灭 WebDAV 中间层。**
+
+```
+之前: APKG → /export → hacdias/webdav → Caddy reverse_proxy → rclone :webdav:
+                            ↑ PROPFIND 缓存走偏
+
+之后: APKG → /export → Caddy file_server → rclone :http:
+                            ↑ 每次 open() 都看到真实 inode
+```
+
+改动清单：
+1. **源站 `apkg.conf`**：`reverse_proxy http://apkg_webdav:8080` → `root * /data/apkg-export` + `file_server browse`
+2. **源站 `incoming` stack**：Caddy 容器挂载 `/swarm-vol/apkg-data/export:/data/apkg-export:ro`
+3. **源站 `apkg` stack**：删除 `webdav` 服务、删除 `stage4/images/webdav/` 目录
+4. **边缘 `deploy-edge.sh`**：rclone `:webdav:` → `:http:` 后端，`--webdav-url` → `--http-url`
+5. **DNS**：`apkg-dav.aiursoft.com` 从橙云（CDN 代理）改为灰云（DNS only）
+6. **访问控制**：`limit_to_cloudflare` → `@edge` IP 白名单（四台边缘 + private_ranges）
+
+**教训**:
+1. WebDAV 是一个有状态的协议层。静态文件服务不需要它——HTTP `file_server` 更简单、更快、没有缓存问题。
+2. Cloudflare 橙云对 API/同步端点是有害的——`max-age=14400` 覆盖了我们设的 `no-cache`。灰云是正确的选择。
+3. 哈希链验证（`[VERIFY]` 步骤）是最后一道防线。如果没有它，我们可能在不知道的情况下把不一致的元数据 serve 给了全球用户。
+4. 在单服务器 Docker Swarm 上，host bind mount 和 named volume 是等价的——但 named volume 更具可移植性。
+5. 永远先查磁盘上的实际文件，再查中间层。这次排查走了不少弯路（怀疑源站更新、怀疑 CF 缓存、怀疑 APKG 代码），最终 SSH 到服务器上 `sha256sum` 一下就知道磁盘数据是对的。
