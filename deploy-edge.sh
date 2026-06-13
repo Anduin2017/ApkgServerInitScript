@@ -339,11 +339,21 @@ while true; do
     echo "[$(date)] [CLEAN] Removing leftover .partial and .prev files..."
     find "$STAGING" \( -name "*.partial" -o -name ".prev" \) -exec rm -rf {} + 2>/dev/null || true
 
-    # Force re-download of APT metadata files.  Hardlink-seeded copies
-    # can match the new file's size exactly (only internal checksums
-    # differ), which fools rclone's default mtime+size comparison.
-    echo "[$(date)] [CLEAN] Purging cached InRelease / Release..."
-    find "$STAGING" -type f \( -name "InRelease" -o -name "Release" \) -delete 2>/dev/null || true
+    # Force re-download of ALL APT metadata files in the hash chain.
+    #
+    #   InRelease → Release → Packages / Packages.* → .deb
+    #
+    # Hardlink-seeded copies can match the new file's size exactly
+    # (only internal checksums differ), which fools rclone's default
+    # mtime+size comparison.  Every file in this chain is vulnerable —
+    # a stale Packages file that happens to have the same byte count as
+    # the new one will pass rclone's check but fail apt's hash-chain
+    # verification (InRelease attests to a different SHA256).
+    #
+    # These files are tiny (KB range) — purging is cheap; stale
+    # metadata is catastrophic (apt update rejects the whole repo).
+    echo "[$(date)] [CLEAN] Purging cached APT metadata (InRelease / Release / Packages)..."
+    find "$STAGING" -type f \( -name "InRelease" -o -name "Release" -o -name "Packages" -o -name "Packages.gz" -o -name "Packages.xz" -o -name "Packages.bz2" \) -delete 2>/dev/null || true
 
     echo "[$(date)] [RCLONE] Starting rclone sync (pass 1)..."
     # --inplace=false (the default for local) forces write-to-tmp + rename,
