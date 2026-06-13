@@ -212,7 +212,12 @@ services:
     container_name: anduinos_sync
     restart: unless-stopped
     entrypoint: ["/bin/sh"]
-    command: ["/sync-logic.sh"]
+    command: ["-c", "/sync-logic.sh 2>&1 | tee -a /data/sync.log"]
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
     volumes:
       - ./data:/data
       - ./sync-logic.sh:/sync-logic.sh:ro
