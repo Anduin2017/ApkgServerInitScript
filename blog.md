@@ -298,6 +298,41 @@ apkg-dav.aiursoft.com {
 3. **启用 Geo-Steering (地理位置调度)：**
 将欧洲的流量划给德国节点，亚太的划给新加坡节点，南北美洲的划给美国节点。中东和非洲由于海底光缆走向，也优先指向欧洲池。
 
+### 5.1 验证 Geo-Steering 是否生效
+
+Cloudflare 提供了一个内置的调试端点 `/cdn-cgi/trace`，可以直接看到请求被哪个边缘节点处理、CF 判断你在地理上属于哪个区域：
+
+```bash
+curl -s https://packages.anduinos.com/cdn-cgi/trace
+```
+
+示例输出（从新加坡发起请求）：
+
+```
+fl=410f618
+h=packages.anduinos.com
+ip=4.145.88.38
+ts=1781339348.000
+visit_scheme=https
+uag=curl/8.18.0
+colo=SIN              ← CF 边缘数据中心: 新加坡
+sliver=none
+http=http/2
+loc=SG                ← CF 判断你的地理位置: 新加坡
+tls=TLSv1.3
+sni=plaintext
+warp=off
+gateway=off
+rbi=off
+kex=X25519MLKEM768
+```
+
+关键字段：
+- **`colo`**: Cloudflare 边缘数据中心代码（`SIN` = 新加坡，`FRA` = 法兰克福，`SEA` = 西雅图）。这个就是你实际命中的 CF 边缘节点。
+- **`loc`**: Cloudflare 根据你的 IP 判断的地理位置（`SG` = 新加坡，`DE` = 德国，`US` = 美国）。Geo-Steering 据此做路由决策。
+
+> **技巧**: 用 VPN 切换到不同国家，再 curl 这个 endpoint，看 `colo` 是否会跟着变。如果从日本发起请求但 `colo` 显示 `SIN`，说明亚太流量被正确导向了新加坡池。
+
 ---
 
 ## 六、 实战：加一台新节点的完整流程
@@ -349,6 +384,21 @@ curl -s http://localhost/sync_status.json
 curl -s -o /dev/null -w “HTTP %{http_code}\n” http://<IPv4>/
 curl -s http://<IPv4>/sync_status.json
 ```
+
+### 6.3.1 验证 Cloudflare Geo-Steering 路由
+
+接入负载均衡后，从不同地理位置确认流量被正确路由：
+
+```bash
+# 查看你当前命中的 CF 边缘节点和地理位置
+curl -s https://packages.anduinos.com/cdn-cgi/trace | grep -E “colo|loc”
+```
+
+- 如果你在新加坡，应看到 `colo=SIN` / `loc=SG`
+- 如果在德国，应看到 `colo=FRA` / `loc=DE`
+- 如果在美国，应看到 `colo=SEA` / `loc=US`
+
+也可以用 VPN 切换地区反复测试，确认 Geo-Steering 策略覆盖了所有预期区域。
 
 ### 6.4 接入 Cloudflare 负载均衡
 
