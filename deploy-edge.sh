@@ -392,8 +392,8 @@ while true; do
             ATTEMPT=$((ATTEMPT + 1))
             echo "[$(date)] [RCLONE] Pass $PASS, attempt $ATTEMPT/$MAX_ATTEMPTS..."
 
-            if rclone sync :webdav: "$STAGING/" \
-                --webdav-url "$SOURCE_URL" \
+            if rclone sync :http: "$STAGING/" \
+                --http-url "$SOURCE_URL" \
                 -v \
                 --delete-after \
                 --inplace=false \
