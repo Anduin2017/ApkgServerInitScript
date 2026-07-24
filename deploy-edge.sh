@@ -344,23 +344,44 @@ while true; do
     echo "[$(date)] [CLEAN] Removing leftover .partial and .prev files..."
     find "$STAGING" \( -name "*.partial" -o -name ".prev" \) -exec rm -rf {} + 2>/dev/null || true
 
-    # Force re-download of ALL APT metadata files in the hash chain.
+    # ── Metadata purge (safety net for hash-chain integrity) ──────
+    #
+    # APT metadata forms a cryptographic hash chain:
     #
     #   InRelease → Release → Packages / Packages.* →
     #   Contents-* / Contents-*.gz → Sources / Sources.* → .deb
     #
-    # Hardlink-seeded copies can match the new file's size exactly
-    # (only internal checksums differ), which fools rclone's default
-    # mtime+size comparison.  Every file in this chain is vulnerable —
-    # a stale Packages or Contents file that happens to have the same
-    # byte count as the new one will pass rclone's check but fail apt's
-    # hash-chain verification (InRelease attests to a different SHA256).
+    # We force re-download of every file in this chain every cycle.
+    # WHY: a hardlink-seeded metadata file can match the *new* file's
+    # size exactly while having different content (e.g. Packages gains
+    # one entry but loses another of the same length).  rclone's
+    # --size-only would skip it → stale metadata passes into staging →
+    # hash-chain verification fails (InRelease SHA256 doesn't match) →
+    # the whole repo is rejected by apt.
     #
     # These files are tiny (KB range) — purging is cheap; stale
-    # metadata is catastrophic (apt update rejects the whole repo).
+    # metadata is catastrophic.
     #
-    # Only .deb (pool/) and .iso (ISO/) are cached via hardlink seed;
-    # they are content-addressed and truly immutable.
+    # ── Why --size-only is safe for .deb files ────────────────────
+    #
+    # .deb files are NOT purged.  They are hardlink-seeded and
+    # compared via rclone --size-only.  This is safe because Debian
+    # packages embed the version in the filename:
+    #
+    #   {pkg}_{epoch:version}_{arch}.deb
+    #
+    # When a package is updated, the version changes → the filename
+    # changes → rclone sees a *new* file and downloads it regardless
+    # of --size-only.  The old version disappears from the source and
+    # is cleaned up by --delete-after.
+    #
+    # Same filename = same version = same content.  There is no
+    # scenario where a .deb file keeps its name but changes content
+    # in a correctly-managed APT repository.
+    #
+    # Combined, the two strategies give us:
+    #   • metadata: always fresh (downloaded every cycle, ~82 MB)
+    #   • .deb:     incremental (only new versions trigger transfer)
     echo "[$(date)] [CLEAN] Purging ALL cached APT metadata files..."
     find "$STAGING" -type f \
         \( -name "InRelease" -o -name "Release" \
