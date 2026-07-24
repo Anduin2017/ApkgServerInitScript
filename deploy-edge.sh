@@ -390,6 +390,7 @@ while true; do
             if rclone sync :http: "$STAGING/" \
                 --http-url "$SOURCE_URL" \
                 -v \
+                --size-only \
                 --delete-after \
                 --inplace=false \
                 --retries 3 \
