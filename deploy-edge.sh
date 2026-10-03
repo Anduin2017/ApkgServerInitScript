@@ -5,14 +5,41 @@
 #
 # This script is safe to run repeatedly on the same server.  Every run will:
 #   • install any missing system packages
-#   • overwrite every config file with the canonical version (self-healing)
+#   • restore changed/missing config files from the canonical version
 #   • pull the latest Docker images
-#   • bring containers up if they are down, or recreate them if config changed
+#   • bring containers up if down; recreate them when config files changed
 #   • leave the existing /opt/anduinos-edge/data untouched
 #
-# The only destructive action is killing an unknown process on port 80 —
-# once the deployment is up, docker-proxy owns that port and re-runs skip it.
+# An unknown service on port 80 is left untouched; deployment stops instead.
+# Existing mirror data is never cleared by the deployer.
 #=============================================================================
+
+# Stop on failed installation/configuration commands instead of reporting success.
+set -e
+set -o pipefail
+
+# Run on an existing edge to wake its own sync loop without redeploying.
+# The shared lock prevents interrupting an active sync; only PID 1's idle
+# one-hour sleep is eligible. No second synchronization process is started.
+if [ "${1:-}" = "--sync-now" ]; then
+    sudo docker exec -i anduinos_sync flock -n /data/.sync.lock sh -s <<'SYNC'
+for pid in $(ps | awk '$4 == "sleep" && $5 == "3600" {print $1}'); do
+    parent=$(awk '/^PPid:/{print $2}' "/proc/$pid/status")
+    if [ "$parent" = 1 ]; then
+        kill -TERM "$pid"
+        echo "Routine sync awakened. Inspect: sudo docker logs -f anduinos_sync"
+        exit 0
+    fi
+done
+echo "No idle routine sleep found; no process changed."
+exit 2
+SYNC
+    exit $?
+fi
+if [ "$#" -ne 0 ]; then
+    echo "Usage: $0 [--sync-now]" >&2
+    exit 2
+fi
 
 #==========================
 # Basic Information
@@ -83,10 +110,8 @@ function port_exist_check() {
 
   print_error "Warning: Port $1 is occupied by an unknown process"
   sudo ss -tlnp "sport = :$1"
-  print_error "Will kill the occupied process in 5s..."
-  sleep 5
-  sudo ss -tlnp "sport = :$1" | grep -oP 'pid=\K[0-9]+' | sudo xargs kill -9
-  print_ok "Killed the occupied process on port $1"
+  print_error "Leaving the existing service untouched. Resolve the port conflict before deploying."
+  return 1
 }
 
 #==========================
@@ -187,12 +212,36 @@ judge "UFW configured"
 #==========================
 WORKDIR="/opt/anduinos-edge"
 print_ok "Creating work directory at $WORKDIR..."
-sudo mkdir -p $WORKDIR/data
-cd $WORKDIR
+sudo mkdir -p "$WORKDIR/data"
+cd "$WORKDIR"
+
+CONFIG_CHANGED=false
+BACKUP_DIR=""
+write_config() {
+    local name="$1" tmp
+    tmp=$(sudo mktemp "$WORKDIR/.${name}.XXXXXX")
+    if ! sudo tee "$tmp" >/dev/null; then
+        sudo rm -f "$tmp"
+        return 1
+    fi
+    sudo chmod 644 "$tmp"
+    if sudo cmp -s "$tmp" "$name"; then
+        sudo rm -f "$tmp"
+        return 0
+    fi
+    if [ -e "$name" ]; then
+        if [ -z "$BACKUP_DIR" ]; then
+            BACKUP_DIR=$(sudo mktemp -d "$WORKDIR/deploy-backup.XXXXXX")
+        fi
+        sudo cp -a "$name" "$BACKUP_DIR/$name"
+    fi
+    sudo mv -Tf "$tmp" "$name"
+    CONFIG_CHANGED=true
+}
 
 # 1. Generate docker-compose.yml
 print_ok "Generating Docker Compose config..."
-sudo bash -c "cat > docker-compose.yml" << 'EOF'
+write_config docker-compose.yml << 'EOF'
 services:
   caddy-server:
     image: caddy:alpine
@@ -212,7 +261,7 @@ services:
     container_name: anduinos_sync
     restart: unless-stopped
     entrypoint: ["/bin/sh"]
-    command: ["-c", "/sync-logic.sh 2>&1 | tee -a /data/sync.log"]
+    command: ["-c", "exec /sync-logic.sh"]
     logging:
       driver: "json-file"
       options:
@@ -234,7 +283,7 @@ EOF
 #   - dists/ : APT metadata (InRelease, Packages, etc.) — never cache (forces revalidation)
 #   - pool/  : .deb packages — content-addressed, immutable, cache forever
 print_ok "Generating pure HTTP Caddyfile..."
-sudo bash -c "cat > Caddyfile" << 'EOF'
+write_config Caddyfile << 'EOF'
 :80 {
     root * /data/current
     file_server browse {
@@ -263,7 +312,7 @@ EOF
 #   2. Clean .partial leftovers from the staging directory (anti-poison)
 #   3. rclone sync into staging → only changed files transferred (incremental)
 #   4. Strip BOM from InRelease / Release
-#   5. ln -sfn staging /data/current   ← one renameat2, genuinely atomic
+#   5. Verify staging, then rename a prepared symlink over /data/current
 #
 # Because staging always contains the previous cycle's data, rclone
 # compares source vs. an almost-identical destination and transfers only
@@ -272,29 +321,164 @@ EOF
 #
 # Idempotent / self-healing properties:
 #   - mkdir -p primary/secondary    → safe to run repeatedly
-#   - ln -sfn                       → overwrites any existing symlink
-#   - Migration from old /data/www  → moves it into secondary, once
-#   - readlink fallback             → handles missing symlink gracefully
+#   - publish_staging              → verifies before replacing current
+#   - repair_layout                → preserves legacy/noncanonical contents
+#   - shared flock                 → serializes sync processes
 #
 print_ok "Generating Atomic Sync logic..."
-sudo bash -c "cat > sync-logic.sh" << 'EOF'
+write_config sync-logic.sh << 'EOF'
 #!/bin/sh
 
-SOURCE_URL="https://apkg-dav.aiursoft.com/"
+SOURCE_URL="${SOURCE_URL:-https://apkg-dav.aiursoft.com/}"
+DATA_ROOT="${DATA_ROOT:-/data}"
+RETRY_DELAY=60
+
+# Only repository metadata is mutable under a stable name.  Never purge the
+# active tree or the versioned .deb pool: the staging tree can be rebuilt on
+# every attempt without interrupting users.
+purge_apt_metadata() {
+    metadata_dir="$1/artifacts/anduinos/dists"
+    [ -n "$1" ] && [ ! -L "$1" ] &&
+        [ ! -L "$1/artifacts" ] && [ ! -L "$1/artifacts/anduinos" ] || return 1
+    # Recreate only the offline staging metadata tree.  BusyBox find does not
+    # implement -delete, and removing the whole tree also clears stale links.
+    rm -rf "$metadata_dir" || return 1
+    mkdir -p "$metadata_dir"
+}
+
+verify_apt_metadata() {
+    metadata_dir="$1/artifacts/anduinos/dists"
+    manifest=$(mktemp /tmp/anduinos-verify.XXXXXX) || return 1
+    verify_failed=false
+    suites_found=0
+
+    for dist_dir in "$metadata_dir"/*; do
+        [ -d "$dist_dir" ] || continue
+        suites_found=$((suites_found + 1))
+        inrelease="$dist_dir/InRelease"
+        if [ ! -f "$inrelease" ]; then
+            echo "[$(date)] [VERIFY] MISSING: $inrelease"
+            verify_failed=true
+            continue
+        fi
+        if ! awk '/^SHA256:/{found=1; next} found && /^[^[:space:]]/{exit} found && NF>=3{print $1,$2,$3}' \
+            "$inrelease" > "$manifest" || [ ! -s "$manifest" ]; then
+            echo "[$(date)] [VERIFY] Missing or unreadable SHA256 manifest: $inrelease"
+            verify_failed=true
+            continue
+        fi
+
+        while read -r expected expected_size file; do
+            case "$file" in
+                ''|/*|.|..|../*|*/..|*/../*)
+                    echo "[$(date)] [VERIFY] Invalid manifest path: $file"
+                    verify_failed=true
+                    continue
+                    ;;
+            esac
+            target="$dist_dir/$file"
+            if [ ! -f "$target" ] || [ -L "$target" ]; then
+                echo "[$(date)] [VERIFY] MISSING: $file in $(basename "$dist_dir")"
+                verify_failed=true
+                continue
+            fi
+            actual_size=$(wc -c < "$target" | tr -d '[:space:]')
+            actual=$(sha256sum "$target" | awk '{print $1}')
+            if [ "$expected_size" != "$actual_size" ] || [ "$expected" != "$actual" ]; then
+                echo "[$(date)] [VERIFY] MISMATCH: $file in $(basename "$dist_dir") (exp=${expected}/${expected_size}, got=${actual}/${actual_size})"
+                verify_failed=true
+            fi
+        done < "$manifest"
+    done
+
+    rm -f "$manifest"
+    if [ "$suites_found" -eq 0 ]; then
+        echo "[$(date)] [VERIFY] No APT distributions found in $metadata_dir"
+        return 1
+    fi
+    [ "$verify_failed" = false ]
+}
+
+failure_backoff() {
+    echo "[$(date)] [RETRY] Retrying in ${RETRY_DELAY}s without touching the active tree."
+    sleep "$RETRY_DELAY"
+    if [ "$RETRY_DELAY" -lt 3600 ]; then
+        RETRY_DELAY=$((RETRY_DELAY * 2))
+        [ "$RETRY_DELAY" -le 3600 ] || RETRY_DELAY=3600
+    fi
+}
+
+# Recover owned layout entries without deleting unknown or legacy contents.
+# A malformed entry is moved aside, so another run can repair it safely.
+repair_layout() {
+    layout_root="$1"
+    mkdir -p "$layout_root" || return 1
+    CURRENT=$(readlink "$layout_root/current" 2>/dev/null || true)
+    case "$CURRENT" in
+        primary|secondary) CURRENT="$layout_root/$CURRENT" ;;
+    esac
+    case "$CURRENT" in
+        "$layout_root/primary"|"$layout_root/secondary")
+            if [ -L "$CURRENT" ]; then
+                echo "[$(date)] [FAIL] Active side is itself a symlink; leaving the serving tree untouched."
+                return 1
+            fi
+            ;;
+        *)
+            if [ -d "$layout_root/current" ]; then
+                echo "[$(date)] [FAIL] Noncanonical current directory is serving data; refusing to move it before publication."
+                return 1
+            fi
+            CURRENT=""
+            ;;
+    esac
+    for side in primary secondary; do
+        entry="$layout_root/$side"
+        if [ -L "$entry" ] || { [ -e "$entry" ] && [ ! -d "$entry" ]; }; then
+            recovery_dir=$(mktemp -d "$layout_root/recovered.XXXXXX") || return 1
+            mv "$entry" "$recovery_dir/$side" || return 1
+            echo "[$(date)] [HEAL] Preserved invalid $side at $recovery_dir/$side."
+        fi
+        mkdir -p "$entry" || return 1
+    done
+
+    [ -z "$CURRENT" ] || return 0
+    # On a fresh or interrupted deployment, select a seed without publishing
+    # anything. Only publish_staging is allowed to create/replace current.
+    if [ -d "$layout_root/www" ] && [ ! -L "$layout_root/www" ]; then
+        cp -al "$layout_root/www/." "$layout_root/secondary/" 2>/dev/null || true
+    fi
+    if [ -f "$layout_root/secondary/sync_status.json" ]; then
+        CURRENT="$layout_root/secondary"
+    else
+        CURRENT="$layout_root/primary"
+    fi
+}
+
+publish_staging() {
+    publish_root="$1"
+    publish_tree="$2"
+    verify_apt_metadata "$publish_tree" || return 1
+    # Replace the status inode too; it may be hardlinked to the active tree.
+    status_tmp=$(mktemp "$publish_tree/.sync-status.XXXXXX") || return 1
+    date -u +"%Y-%m-%dT%H:%M:%SZ" > "$status_tmp" || return 1
+    mv -f "$status_tmp" "$publish_tree/sync_status.json" || return 1
+    link_dir=$(mktemp -d "$publish_root/.link.XXXXXX") || return 1
+    if ln -s "$publish_tree" "$link_dir/current" && mv -Tf "$link_dir/current" "$publish_root/current"; then
+        rmdir "$link_dir" || true
+        echo "[$(date)] [SWAP] Atomically switched current to $publish_tree."
+        return 0
+    fi
+    rm -f "$link_dir/current"
+    rmdir "$link_dir" || true
+    return 1
+}
 
 echo "[$(date)] [INIT] Rclone worker started."
 
-# ── One-time migration from old layout ──────────────────────────
-if [ -d /data/www ] && [ ! -L /data/current ]; then
-    echo "[$(date)] [MIGRATE] Moving old /data/www → /data/secondary..."
-    mv /data/www /data/secondary 2>/dev/null || true
-    mkdir -p /data/primary
-    ln -sfn /data/secondary /data/current
-    echo "[$(date)] [MIGRATE] Done."
-fi
-
 while true; do
     echo "[$(date)] [CYCLE] Starting sync cycle..."
+    CYCLE_OK=false
 
     # ── Mutual exclusion ─────────────────────────────────────────
     # Prevent two sync processes from writing to the same staging
@@ -303,7 +487,8 @@ while true; do
     #
     # BusyBox flock does not support -w; we implement our own
     # wait loop with -n (non-blocking).
-    exec 200>/tmp/sync.lock
+    mkdir -p "$DATA_ROOT" || { failure_backoff; continue; }
+    exec 200>"$DATA_ROOT/.sync.lock"
     LOCK_WAITED=0
     while ! flock -n 200 2>/dev/null; do
         sleep 10
@@ -316,21 +501,16 @@ while true; do
     done
     echo "[$(date)] [LOCK] Acquired (waited ${LOCK_WAITED}s)."
 
-    # Ensure base directories exist (idempotent)
-    mkdir -p /data/primary /data/secondary
-
-    # Determine active directory and staging target
-    CURRENT=$(readlink /data/current 2>/dev/null || echo "/data/primary")
-    if [ "$CURRENT" = "/data/primary" ]; then
-        STAGING="/data/secondary"
-    else
-        STAGING="/data/primary"
+    if ! repair_layout "$DATA_ROOT"; then
+        echo "[$(date)] [FAIL] Layout repair failed; retrying."
+        exec 200>&-
+        failure_backoff
+        continue
     fi
-
-    # Create symlink if missing (self-healing)
-    if [ ! -L /data/current ]; then
-        echo "[$(date)] [HEAL] Symlink missing — recreating."
-        ln -sfn "$STAGING" /data/current
+    if [ "$CURRENT" = "$DATA_ROOT/primary" ]; then
+        STAGING="$DATA_ROOT/secondary"
+    else
+        STAGING="$DATA_ROOT/primary"
     fi
 
     echo "[$(date)] [LAYOUT] Current → $CURRENT  |  Staging → $STAGING"
@@ -345,22 +525,11 @@ while true; do
     find "$STAGING" \( -name "*.partial" -o -name ".prev" \) -exec rm -rf {} + 2>/dev/null || true
 
     # ── Metadata purge (safety net for hash-chain integrity) ──────
-    #
-    # APT metadata forms a cryptographic hash chain:
-    #
-    #   InRelease → Release → Packages / Packages.* →
-    #   Contents-* / Contents-*.gz → Sources / Sources.* → .deb
-    #
-    # We force re-download of every file in this chain every cycle.
-    # WHY: a hardlink-seeded metadata file can match the *new* file's
-    # size exactly while having different content (e.g. Packages gains
-    # one entry but loses another of the same length).  rclone's
-    # --size-only would skip it → stale metadata passes into staging →
-    # hash-chain verification fails (InRelease SHA256 doesn't match) →
-    # the whole repo is rejected by apt.
-    #
-    # These files are tiny (KB range) — purging is cheap; stale
-    # metadata is catastrophic.
+    # InRelease signs every file below dists/, including DEP-11 icon
+    # archives.  A changed file can keep the same size, so --size-only
+    # must never compare hardlink-seeded metadata.  Purge the entire
+    # staging dists/ tree each cycle and re-download it from the source.
+    # The active tree and versioned .deb pool remain untouched.
     #
     # ── Why --size-only is safe for .deb files ────────────────────
     #
@@ -380,15 +549,14 @@ while true; do
     # in a correctly-managed APT repository.
     #
     # Combined, the two strategies give us:
-    #   • metadata: always fresh (downloaded every cycle, ~82 MB)
+    #   • metadata: always fresh (downloaded every cycle)
     #   • .deb:     incremental (only new versions trigger transfer)
-    echo "[$(date)] [CLEAN] Purging ALL cached APT metadata files..."
-    find "$STAGING" -type f \
-        \( -name "InRelease" -o -name "Release" \
-        -o -name "Packages" -o -name "Packages.gz" -o -name "Packages.xz" -o -name "Packages.bz2" \
-        -o -name "Contents-*" -o -name "Contents-*.gz" -o -name "Contents-*.xz" -o -name "Contents-*.bz2" \
-        -o -name "Sources" -o -name "Sources.gz" -o -name "Sources.xz" -o -name "Sources.bz2" \) \
-        -delete 2>/dev/null || true
+    echo "[$(date)] [CLEAN] Purging cached staging APT metadata..."
+    SYNC_OK=true
+    if ! purge_apt_metadata "$STAGING"; then
+        echo "[$(date)] [FAIL] Could not purge staging metadata; refusing to sync or swap."
+        SYNC_OK=false
+    fi
 
     # ── Two-pass rclone sync with retry ───────────────────────────
     #
@@ -398,11 +566,11 @@ while true; do
     # Strategy: up to 3 attempts per pass, 30s backoff between
     # retries, 10s gap between passes.  This gives the source time
     # to finish any in-progress atomic update cycle.
-    SYNC_OK=true
     MAX_ATTEMPTS=3
     RETRY_GAP=30
 
     for PASS in 1 2; do
+        [ "$SYNC_OK" = true ] || break
         ATTEMPT=0
         while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
             ATTEMPT=$((ATTEMPT + 1))
@@ -448,43 +616,13 @@ while true; do
             sed -i "1s/^$(printf '\357\273\277')//" "$f"
         done
 
-        # ── Hash-chain integrity verification ──────────────────────
-        # Before swapping, verify that every file listed in each
-        # InRelease SHA256 section actually matches its attested hash.
-        # This is the ULTIMATE safety net — if anything (mtime+size
-        # deception, partial transfer, source inconsistency, rclone
-        # bug) produced stale or corrupted metadata, we catch it here
-        # and REFUSE to swap.  The currently-serving data stays live.
+        # Verify every signed metadata file, including DEP-11 and missing
+        # files, before publishing this staging tree.
         echo "[$(date)] [VERIFY] Checking APT hash chain integrity..."
-        VERIFY_FAILED=0
-        for inrelease in "$STAGING"/artifacts/anduinos/dists/*/InRelease; do
-            [ -f "$inrelease" ] || continue
-            dist_dir=$(dirname "$inrelease")
-            awk '/^SHA256:/{found=1; next} /^-----BEGIN/{found=0} found && NF>=3{print $1,$3}' "$inrelease" | while read -r expected file; do
-                target="$dist_dir/$file"
-                if [ -f "$target" ]; then
-                    actual=$(sha256sum "$target" | awk '{print $1}')
-                    if [ "$expected" != "$actual" ]; then
-                        echo "[$(date)] [VERIFY] MISMATCH: $file (exp=${expected}, got=${actual})"
-                        echo "FAIL" >/tmp/verify_result
-                    fi
-                fi
-            done
-            if [ -f /tmp/verify_result ]; then
-                VERIFY_FAILED=1
-                rm -f /tmp/verify_result
-                break
-            fi
-        done
-
-        if [ $VERIFY_FAILED -eq 1 ]; then
-            echo "[$(date)] [FAIL] Hash chain verification failed — refusing to swap."
+        if publish_staging "$DATA_ROOT" "$STAGING"; then
+            CYCLE_OK=true
         else
-            echo "[$(date)] [VERIFY] Hash chain OK."
-            date -u +"%Y-%m-%dT%H:%M:%SZ" > "$STAGING/sync_status.json"
-            echo "[$(date)] [SWAP] ln -sfn $STAGING → /data/current..."
-            ln -sfn "$STAGING" /data/current
-            echo "[$(date)] [SWAP] Done. Sync cycle complete."
+            echo "[$(date)] [FAIL] Verification or publication failed; old data remains live."
         fi
     else
         echo "[$(date)] [FAIL] Sync cycle failed. Production data NOT touched."
@@ -493,8 +631,13 @@ while true; do
     # Release lock
     exec 200>&-
 
-    echo "[$(date)] [SLEEP] 1 hour..."
-    sleep 3600
+    if [ "${CYCLE_OK:-false}" = true ]; then
+        RETRY_DELAY=60
+        echo "[$(date)] [SLEEP] 1 hour until the next routine sync."
+        sleep 3600
+    else
+        failure_backoff
+    fi
 done
 EOF
 sudo chmod +x sync-logic.sh
@@ -504,14 +647,16 @@ sudo chmod +x sync-logic.sh
 #==========================
 print_ok "Pulling latest images and launching services..."
 sudo docker compose pull
-sudo docker compose up -d
-
-# Force-restart containers so they pick up volume-mount scripts
-# (sync-logic.sh, Caddyfile) even when docker-compose.yml itself
-# hasn't changed.  docker compose up -d only recreates containers
-# on compose-file changes, not on mounted-file changes.
-sudo docker restart anduinos_sync anduinos_caddy 2>/dev/null || true
-judge "Docker Compose services started"
+# Replacing a bind-mounted file changes its inode. Recreate containers when
+# configuration changed so they mount the new files; restart alone is insufficient.
+if [ "$CONFIG_CHANGED" = true ]; then
+    sudo docker compose up -d --force-recreate --wait --wait-timeout 7500
+else
+    sudo docker compose up -d --wait --wait-timeout 7500
+fi
+curl --fail --silent --show-error --retry 5 --retry-connrefused \
+    http://127.0.0.1/sync_status.json
+judge "Docker Compose services and mirror endpoint ready"
 
 #==========================
 # Post-Installation Summary
