@@ -39,13 +39,42 @@ fi
 HTTPS_DOMAIN=""
 if [ "$#" -eq 2 ] && [ "$1" = "--https-domain" ]; then
     HTTPS_DOMAIN="$2"
-    if [ "${#HTTPS_DOMAIN}" -gt 253 ] || ! [[ "$HTTPS_DOMAIN" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]([a-z0-9-]{0,61}[a-z0-9])?$ ]]; then
-        echo "Expected a lowercase DNS hostname for --https-domain." >&2
+    if [ -z "$HTTPS_DOMAIN" ]; then
+        echo "Expected a hostname for --https-domain." >&2
         exit 2
     fi
 elif [ "$#" -ne 0 ]; then
     echo "Usage: $0 [--sync-now | --https-domain hostname]" >&2
     exit 2
+fi
+
+# The deployed site address is also the saved deployment mode. Reuse it on
+# no-argument upgrades so an HTTPS mirror cannot silently become HTTP-only.
+WORKDIR="/opt/anduinos-edge"
+if [ -z "$HTTPS_DOMAIN" ]; then
+    if sudo test -e "$WORKDIR/Caddyfile"; then
+        SITE_ADDRESS=$(sudo awk '
+            /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+            { if (NF == 2 && $2 == "{") print $1; exit }
+        ' "$WORKDIR/Caddyfile")
+        case "$SITE_ADDRESS" in
+            :80) ;;
+            "")
+                echo "Cannot recognize the deployed Caddyfile; specify --https-domain hostname explicitly." >&2
+                exit 2
+                ;;
+            *) HTTPS_DOMAIN="$SITE_ADDRESS" ;;
+        esac
+    elif sudo test -d "$WORKDIR/caddy-data" || sudo test -d "$WORKDIR/caddy-config"; then
+        echo "HTTPS state exists but Caddyfile is missing; specify --https-domain hostname explicitly." >&2
+        exit 2
+    fi
+fi
+if [ -n "$HTTPS_DOMAIN" ]; then
+    if [ "${#HTTPS_DOMAIN}" -gt 253 ] || ! [[ "$HTTPS_DOMAIN" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]([a-z0-9-]{0,61}[a-z0-9])?$ ]]; then
+        echo "Expected a lowercase DNS hostname; specify --https-domain hostname explicitly." >&2
+        exit 2
+    fi
 fi
 
 #==========================
@@ -223,7 +252,6 @@ judge "UFW configured"
 #==========================
 # Build AnduinOS Edge Environment
 #==========================
-WORKDIR="/opt/anduinos-edge"
 print_ok "Creating work directory at $WORKDIR..."
 sudo mkdir -p "$WORKDIR/data"
 cd "$WORKDIR"
