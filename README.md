@@ -23,8 +23,13 @@ Point the hostname's A record, and its AAAA record if IPv6 is configured, at
 this server. Allow inbound TCP 80/443 and UDP 443 in the cloud firewall.
 Caddy automatically obtains and renews certificates. Certificate and autosave
 state persist under `/opt/anduinos-edge/caddy-data` and `caddy-config`, separately
-from the read-only mirror data. Repeat the same command when redeploying a
-HTTPS node. Back up the certificate state alongside the deployment configuration.
+from the read-only mirror data. On subsequent runs, `bash deploy-edge.sh`
+reads the existing Caddyfile and preserves its HTTP or HTTPS mode and hostname.
+Existing HTTP-only nodes need no new arguments. Use `--https-domain` to enable
+HTTPS for the first time or explicitly change the hostname. Unrecognized site
+configuration, or missing configuration with existing certificate state, stops
+deployment before system changes instead of silently downgrading to HTTP.
+Back up the certificate state alongside the deployment configuration.
 
 The installer installs dependencies and Docker if needed, enables UFW, and
 configures ports. Use a dedicated server rather than running it over unrelated
