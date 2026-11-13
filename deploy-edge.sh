@@ -36,8 +36,15 @@ exit 2
 SYNC
     exit $?
 fi
-if [ "$#" -ne 0 ]; then
-    echo "Usage: $0 [--sync-now]" >&2
+HTTPS_DOMAIN=""
+if [ "$#" -eq 2 ] && [ "$1" = "--https-domain" ]; then
+    HTTPS_DOMAIN="$2"
+    if [ "${#HTTPS_DOMAIN}" -gt 253 ] || ! [[ "$HTTPS_DOMAIN" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]([a-z0-9-]{0,61}[a-z0-9])?$ ]]; then
+        echo "Expected a lowercase DNS hostname for --https-domain." >&2
+        exit 2
+    fi
+elif [ "$#" -ne 0 ]; then
+    echo "Usage: $0 [--sync-now | --https-domain hostname]" >&2
     exit 2
 fi
 
@@ -170,7 +177,9 @@ else
     print_ok "Docker is already installed."
 fi
 # Ensure docker compose plugin is installed
-DEBIAN_FRONTEND=noninteractive sudo apt install -y docker-compose-plugin
+if ! sudo docker compose version >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive sudo apt install -y docker-compose-plugin
+fi
 
 # Ensure Docker daemon is running (may be stopped on re-run)
 # Also ensure it starts on boot (defence in depth for VPS templates)
@@ -204,6 +213,10 @@ sudo timedatectl set-timezone UTC
 print_ok "Configuring UFW firewall..."
 sudo ufw allow 22/tcp
 sudo ufw allow 80/tcp
+if [ -n "$HTTPS_DOMAIN" ]; then
+    sudo ufw allow 443/tcp
+    sudo ufw allow 443/udp
+fi
 echo "y" | sudo ufw enable
 judge "UFW configured"
 
@@ -239,9 +252,23 @@ write_config() {
     CONFIG_CHANGED=true
 }
 
+# Direct HTTPS keeps certificate state separate from the read-only mirror.
+# Empty fragments preserve the existing HTTP-only deployment by default.
+HTTPS_PORTS=""
+HTTPS_ENVIRONMENT=""
+HTTPS_VOLUMES=""
+CADDY_ADDRESS=":80"
+if [ -n "$HTTPS_DOMAIN" ]; then
+    CADDY_ADDRESS="$HTTPS_DOMAIN"
+    HTTPS_PORTS=$'      - "443:443"\n      - "443:443/udp"\n'
+    HTTPS_ENVIRONMENT=$'    environment:\n      XDG_DATA_HOME: /var/lib/caddy\n      XDG_CONFIG_HOME: /var/lib/caddy-config\n'
+    HTTPS_VOLUMES=$'      - ./caddy-data:/var/lib/caddy\n      - ./caddy-config:/var/lib/caddy-config\n'
+    sudo mkdir -p "$WORKDIR/caddy-data" "$WORKDIR/caddy-config"
+fi
+
 # 1. Generate docker-compose.yml
 print_ok "Generating Docker Compose config..."
-write_config docker-compose.yml << 'EOF'
+write_config docker-compose.yml << EOF
 services:
   caddy-server:
     image: caddy:alpine
@@ -249,10 +276,10 @@ services:
     restart: unless-stopped
     ports:
       - "80:80"
-    volumes:
+${HTTPS_PORTS}${HTTPS_ENVIRONMENT}    volumes:
       - ./data:/data:ro
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
-    depends_on:
+${HTTPS_VOLUMES}    depends_on:
       rclone-worker:
         condition: service_healthy
 
@@ -278,13 +305,13 @@ services:
       start_period: 7200s
 EOF
 
-# 2. Generate Caddyfile (Pure HTTP)
+# 2. Generate Caddyfile (HTTP-only default or direct automatic HTTPS)
 # Cache strategy:
 #   - dists/ : APT metadata (InRelease, Packages, etc.) — never cache (forces revalidation)
 #   - pool/  : .deb packages — content-addressed, immutable, cache forever
-print_ok "Generating pure HTTP Caddyfile..."
-write_config Caddyfile << 'EOF'
-:80 {
+print_ok "Generating Caddyfile for $CADDY_ADDRESS..."
+write_config Caddyfile << EOF
+$CADDY_ADDRESS {
     root * /data/current
     file_server browse {
         hide _tmp .prev .partial .tmp
@@ -670,11 +697,20 @@ echo -e "${Blue}The server is now acting as a mirror node.${Font}"
 echo -e "Rclone is syncing from apkg-dav in the background."
 echo -e "To view sync logs, run: ${Yellow}docker logs -f anduinos_sync${Font}\n"
 
-echo -e "${RedBG} !!! ACTION REQUIRED ON CLOUDFLARE !!! ${Font}"
-echo -e "Because this node uses pure HTTP (no certificates):"
-echo -e "1. Go to your Cloudflare Dashboard for ${Yellow}anduinos.com${Font}."
-echo -e "2. Add a DNS A Record: ${Yellow}packages.anduinos.com${Font} -> ${Yellow}$SERVER_IP${Font} (Orange Cloud ON)."
-echo -e "3. Go to ${Yellow}SSL/TLS -> Overview${Font}."
-echo -e "4. Set encryption mode to ${Yellow}Flexible${Font}."
+if [ -n "$HTTPS_DOMAIN" ]; then
+    echo -e "Direct HTTPS endpoint: ${Yellow}https://$HTTPS_DOMAIN/${Font}"
+    echo -e "Point the domain's A/AAAA records directly at this node."
+    echo -e "Allow inbound TCP 80/443 and UDP 443 in the cloud firewall."
+    echo -e "Caddy obtains and renews its own certificates; no Cloudflare proxy is required."
+    echo -e "Certificate state is preserved in $WORKDIR/caddy-data."
+    echo -e "Verify: curl --fail https://$HTTPS_DOMAIN/sync_status.json"
+else
+    echo -e "${RedBG} !!! ACTION REQUIRED ON CLOUDFLARE !!! ${Font}"
+    echo -e "Because this node uses pure HTTP (no certificates):"
+    echo -e "1. Go to your Cloudflare Dashboard for ${Yellow}anduinos.com${Font}."
+    echo -e "2. Add a DNS A Record: ${Yellow}packages.anduinos.com${Font} -> ${Yellow}$SERVER_IP${Font} (Orange Cloud ON)."
+    echo -e "3. Go to ${Yellow}SSL/TLS -> Overview${Font}."
+    echo -e "4. Set encryption mode to ${Yellow}Flexible${Font}."
+fi
 
 echo -e "\n${Green}Enjoy your tea, Architecture Master!${Font}\n"
